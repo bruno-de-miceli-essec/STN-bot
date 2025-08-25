@@ -98,10 +98,22 @@ async def sync_notion_checkbox_from_forms() -> int:
     """Coche la case 'A répondu' pour les emails présents dans les réponses de Form."""
     notion = AsyncClient(auth=NOTION_TOKEN)
     try:
-        emails = await collect_emails_via_gateway_from_notion_forms(notion)
-        if not emails:
-            print("(Sync) Aucun email récupéré via la gateway — synchro ignorée")
+        # Construire un mapping {formId: set(emails)}
+        resp_forms = await notion.databases.query(database_id=str(NOTION_DATABASE_ID))
+        form_id_to_emails = {}
+        for page in resp_forms.get("results", []):
+            props = page.get("properties", {})
+            form_id_prop = props.get("Form ID")
+            fid = None
+            if form_id_prop and form_id_prop.get("rich_text"):
+                fid = (form_id_prop["rich_text"][0].get("plain_text") or "").strip()
+            if fid and fid not in form_id_to_emails:
+                form_id_to_emails[fid] = get_form_emails_from_gateway_by_id(fid)
+
+        if not form_id_to_emails:
+            print("(Sync) Aucun Form ID détecté dans Notion — synchro ignorée")
             return 0
+
         resp = await notion.databases.query(database_id=str(NOTION_DATABASE_ID))
         results = resp.get("results", [])
         updated = 0
@@ -112,10 +124,17 @@ async def sync_notion_checkbox_from_forms() -> int:
             email_prop = props.get("Email")
             email = email_prop.get("email") if isinstance(email_prop, dict) else None
 
+            # Extraire le Form ID pour cette ligne
+            form_id_prop = props.get("Form ID")
+            fid = None
+            if form_id_prop and form_id_prop.get("rich_text"):
+                fid = (form_id_prop["rich_text"][0].get("plain_text") or "").strip()
+            emails_for_form = form_id_to_emails.get(fid, set())
+
             answered_prop = props.get("A répondu")
             answered = answered_prop.get("checkbox", False) if isinstance(answered_prop, dict) else False
 
-            if email and email.lower() in emails:
+            if email and email.lower() in emails_for_form:
                 matched += 1
                 if not answered:
                     page_id = page["id"]

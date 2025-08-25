@@ -1,6 +1,7 @@
 import os
 import requests
 from flask import Flask, request
+import scanner as s
 
 # --- Basic Auth helpers and environment variables ---
 import base64
@@ -11,6 +12,12 @@ from flask import Response
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "password")
 
+app = Flask(__name__)
+
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "SantanaESSEC2526@")
+PAGE_TOKEN = os.getenv("PAGE_TOKEN")
+
+# --- Basic Auth helpers and decorator ---
 def _ct_eq(a, b):
     """Constant-time string comparison."""
     return hmac.compare_digest(a, b)
@@ -47,10 +54,77 @@ def requires_auth(exempt_paths=None):
         return wrapper
     return decorator
 
-app = Flask(__name__)
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "SantanaESSEC2526@")
-PAGE_TOKEN = os.getenv("PAGE_TOKEN")
+def render_admin(status_msg: str = ""):
+    # Minimal HTML admin page with two POST buttons and a status banner
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Panel</title>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 2em;
+        }}
+        .status {{
+            background: #f0f0f0;
+            border: 1px solid #bbb;
+            padding: 0.5em 1em;
+            margin-bottom: 1em;
+            border-radius: 4px;
+            color: #333;
+            min-height: 1.5em;
+        }}
+        form {{
+            display: inline-block;
+            margin-right: 1em;
+        }}
+        button {{
+            padding: 0.5em 1.5em;
+            font-size: 1em;
+            border: 1px solid #888;
+            border-radius: 4px;
+            background: #eee;
+            cursor: pointer;
+        }}
+        button:hover {{
+            background: #e0e0e0;
+        }}
+    </style>
+</head>
+<body>
+    <h2>Admin Panel</h2>
+    <div class="status">{status_msg}</div>
+    <form method="post" action="/admin/sync">
+        <button type="submit">Synchroniser les réponses</button>
+    </form>
+    <form method="post" action="/admin/send">
+        <button type="submit">Envoyer les rappels</button>
+    </form>
+</body>
+</html>
+"""
+@app.route("/admin", methods=["GET"])
+@requires_auth()
+def admin_panel():
+    return render_admin()
+
+
+@app.route("/admin/sync", methods=["POST"])
+@requires_auth()
+def admin_sync():
+    updated = s.run_sync_from_forms_sync()
+    return render_admin(f"Synchronisation OK — {updated} nouvelles réponses mises à jour dans Notion")
+
+
+@app.route("/admin/send", methods=["POST"])
+@requires_auth()
+def admin_send():
+    sent = s.run_send_reminders_sync()
+    return render_admin(f"Rappels envoyés : {sent}")
+
+
 
 
 # Fonction pour envoyer un message via l'API Messenger
