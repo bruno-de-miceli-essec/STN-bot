@@ -5,11 +5,14 @@ import functools
 import hmac
 import requests
 from flask import Flask, request, Response
-from db import Base, engine
-import models  # noqa: F401 (garantit l’import des modèles)
-import scanner as s  # logique Notion/Forms/Send
+from db import init_db, SessionLocal
+import models  # noqa: F401
+import scanner as s
 
 app = Flask(__name__)
+
+# Initialise la base à chaque démarrage (idempotent)
+init_db()
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "SantanaESSEC2526@")
 PAGE_TOKEN = os.getenv("PAGE_TOKEN")
@@ -66,20 +69,20 @@ body {{ font-family: system-ui, -apple-system, Arial; margin: 2rem; }}
 button {{ padding:.6rem 1.1rem; border:1px solid #888; border-radius:6px; background:#eee; cursor:pointer; }}
 button:hover {{ background:#e2e2e2; }}
 form {{ display:inline-block; margin-right: .5rem; }}
+.nav a {{ margin-right: 1rem; text-decoration:none; }}
 </style></head>
 <body>
 <h2>Admin Panel</h2>
+<div class=\"nav\"><a href=\"/admin\">Accueil</a><a href=\"/admin/forms\">Forms</a></div>
 <div class=\"status\">{status_msg}</div>
 <form method=\"post\" action=\"/admin/sync\"><button type=\"submit\">Synchroniser les réponses</button></form>
 <form method=\"post\" action=\"/admin/send\"><button type=\"submit\">Envoyer les rappels</button></form>
 </body></html>"""
 
-
 @app.route("/admin", methods=["GET"])  
 @requires_auth()
 def admin_panel():
     return render_admin()
-
 
 @app.route("/admin/sync", methods=["POST"])  
 @requires_auth()
@@ -87,13 +90,65 @@ def admin_sync():
     updated = s.run_sync_from_forms_sync()
     return render_admin(f"Synchronisation OK — {updated} nouvelles réponses mises à jour dans Notion")
 
-
 @app.route("/admin/send", methods=["POST"])  
 @requires_auth()
 def admin_send():
     sent = s.run_send_reminders_sync()
     return render_admin(f"Rappels envoyés : {sent}")
 
+from db import SessionLocal
+
+@app.route("/admin/forms", methods=["GET"]) 
+@requires_auth()
+def admin_forms_list():
+    forms = s.get_forms_summary()
+    rows = "".join(
+        f"<tr><td>{f['id']}</td><td>{f['google_form_id']}</td><td>{f['responses_count']}</td>"
+        f"<td><form method='post' action='/admin/form/{f['id']}/sync' style='display:inline'><button type='submit'>Sync</button></form> "
+        f"<a href='/admin/form/{f['id']}'>Voir</a></td></tr>" for f in forms
+    )
+    html = f"""
+    <html><head><meta charset='utf-8'><title>Forms</title></head><body>
+    <h2>Forms suivis</h2>
+    <div><a href='/admin'>← Retour</a></div>
+    <table border='1' cellpadding='6' cellspacing='0'>
+    <tr><th>ID</th><th>Google Form ID</th><th>Réponses en DB</th><th>Actions</th></tr>
+    {rows}
+    </table>
+    </body></html>
+    """
+    return html
+
+@app.route("/admin/form/<int:form_id>", methods=["GET"]) 
+@requires_auth()
+def admin_form_detail(form_id: int):
+    with SessionLocal() as db:
+        f = db.query(models.Form).filter(models.Form.id == form_id).first()
+        if not f:
+            return render_admin("Form introuvable"), 404
+        responses = db.query(models.Response).filter(models.Response.form_id == form_id).order_by(models.Response.submitted_at.desc()).all()
+        rows = "".join(f"<tr><td>{r.email}</td><td>{r.submitted_at}</td></tr>" for r in responses)
+        html = f"""
+        <html><head><meta charset='utf-8'><title>Détail Form</title></head><body>
+        <h2>Form: {f.google_form_id}</h2>
+        <div><a href='/admin/forms'>← Retour liste</a></div>
+        <form method='post' action='/admin/form/{form_id}/sync'><button type='submit'>Resynchroniser</button></form>
+        <table border='1' cellpadding='6' cellspacing='0'>
+        <tr><th>Email</th><th>Reçu le</th></tr>
+        {rows}
+        </table>
+        </body></html>
+        """
+        return html
+
+@app.route("/admin/form/<int:form_id>/sync", methods=["POST"]) 
+@requires_auth()
+def admin_form_sync(form_id: int):
+    try:
+        updated = s.run_sync_single_form_sync(form_id)
+        return render_admin(f"Resync OK — mises à jour Notion: {updated}")
+    except Exception as e:
+        return render_admin(f"Erreur resync: {e}"), 500
 
 # --- Messenger webhook -------------------------------------------------------
 
@@ -110,12 +165,26 @@ def send_message(recipient_id: str, text: str) -> None:
     except Exception as e:
         print(f"(Webhook) Exception send_message: {e}")
 
-
 @app.route("/", methods=["GET"])  
 @requires_auth()
 def index():
-    return "ok", 200
-
+    return (
+        """<!doctype html>
+<html lang=\"fr\"><head><meta charset=\"utf-8\"><title>STN-bot</title>
+<style>
+body{font-family:system-ui,-apple-system,Arial;margin:2rem}
+.card{border:1px solid #ccc;border-radius:8px;padding:1rem;display:inline-block}
+.btn{padding:.6rem 1.1rem;border:1px solid #888;border-radius:6px;background:#eee;cursor:pointer;text-decoration:none;color:#000}
+.btn:hover{background:#e2e2e2}
+</style></head><body>
+<h2>STN-bot</h2>
+<div class=\"card\">
+<p>Instance en ligne : statut <b>OK</b></p>
+<a class=\"btn\" href=\"/admin\">Accès admin</a>
+</div>
+</body></html>""",
+        200,
+    )
 
 @app.route("/webhook", methods=["GET", "POST"])  
 def webhook():
@@ -141,10 +210,3 @@ def webhook():
     except Exception as e:
         print(f"(Webhook) Parse error: {e}")
     return "EVENT_RECEIVED", 200
-
-with engine.begin() as conn:
-    Base.metadata.create_all(bind=conn)
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "3000"))
-    app.run(host="0.0.0.0", port=port)

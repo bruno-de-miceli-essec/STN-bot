@@ -9,6 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from db import SessionLocal
 from models import Form, Response
 from datetime import datetime
+from db import init_db
+
+init_db()
 
 import requests
 from notion_client import AsyncClient
