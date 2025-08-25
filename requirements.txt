@@ -1,0 +1,4 @@
+flask==3.0.3requests
+streamlit
+notion-client
+python-dotenv
