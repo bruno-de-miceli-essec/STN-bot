@@ -5,7 +5,8 @@ import functools
 import hmac
 import requests
 from flask import Flask, request, Response
-
+from db import Base, engine
+import models  # noqa: F401 (garantit l’import des modèles)
 import scanner as s  # logique Notion/Forms/Send
 
 app = Flask(__name__)
@@ -141,6 +142,8 @@ def webhook():
         print(f"(Webhook) Parse error: {e}")
     return "EVENT_RECEIVED", 200
 
+with engine.begin() as conn:
+    Base.metadata.create_all(bind=conn)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "3000"))
