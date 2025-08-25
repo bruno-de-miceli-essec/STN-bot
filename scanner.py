@@ -1,265 +1,236 @@
-# scanner.py — logique métier (AUCUNE UI ici)
+# scanner.py — logique Notion + Forms + envoi Messenger
+from __future__ import annotations
 import os
 import asyncio
-import datetime
-from typing import Set
+import time
+from typing import Dict, List, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
-from dotenv import load_dotenv
 from notion_client import AsyncClient
 
-# Charger .env (sans écraser l’existant)
-load_dotenv(dotenv_path=".env", override=False)
-
-# --- Config ---
-FORMS_GATEWAY_URL = os.getenv("FORMS_GATEWAY_URL")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+# --- Configuration via variables d'environnement ---
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+FORMS_GATEWAY_URL = os.getenv("FORMS_GATEWAY_URL")  # Apps Script /exec qui renvoie des emails par formId
 PAGE_TOKEN = os.getenv("PAGE_TOKEN")
 
-# Options d’exécution
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
-MIN_REMINDER_DAYS = int(os.getenv("MIN_REMINDER_DAYS", "0") or 0)
-RATE_LIMIT_MS = int(os.getenv("RATE_LIMIT_MS", "0") or 0)
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+MIN_REMINDER_DAYS = int(os.getenv("MIN_REMINDER_DAYS", "0"))  # réservé si tu veux filtrer selon une date
+RATE_LIMIT_MS = int(os.getenv("RATE_LIMIT_MS", "0"))  # délai entre envois pour FB
+
+if not NOTION_TOKEN or not NOTION_DATABASE_ID:
+    # Laisse passer l'import côté app.py, mais garde une info utile pour /admin
+    print("[scanner] WARN: NOTION_TOKEN/NOTION_DATABASE_ID non définis")
 
 
-# --------------------------- Gateway Forms ---------------------------
+# --- Helpers Forms -----------------------------------------------------------
 def get_form_emails_from_gateway_by_id(form_id: str) -> Set[str]:
-    """Appelle la gateway Apps Script et renvoie un set d'emails (lowercase)."""
-    if not FORMS_GATEWAY_URL:
+    """Appelle la gateway Apps Script pour récupérer les emails d'un form donné.
+    Retourne un set d'emails (lowercased)."""
+    if not FORMS_GATEWAY_URL or not form_id:
         return set()
     try:
         resp = requests.get(FORMS_GATEWAY_URL, params={"formId": form_id}, timeout=20)
         resp.raise_for_status()
-        payload = resp.json() or {}
-        emails = payload.get("emails") or []
-        people = payload.get("people") or []
-        extracted = []
-        extracted.extend([str(e).strip().lower() for e in emails if e])
-        for p in people:
-            em = str(p.get("email", "")).strip().lower()
-            if em:
-                extracted.append(em)
-        return set(extracted)
+        data = resp.json() or []
+        emails = {str(x).strip().lower() for x in data if x}
+        return emails
     except Exception as e:
         print(f"(Gateway) Erreur lors de la récupération des emails pour formId={form_id}: {e}")
         return set()
 
 
-async def collect_emails_via_gateway_from_notion_forms(notion: AsyncClient) -> Set[str]:
-    """Parcourt la DB Notion, récupère les Form ID (rich text) et agrège les emails via la gateway."""
-    form_ids: Set[str] = set()
-    resp = await notion.databases.query(database_id=str(NOTION_DATABASE_ID))
-    results = resp.get("results", [])
-    for page in results:
-        props = page.get("properties", {})
-        form_id_prop = props.get("Form ID")
-        fid = None
-        if form_id_prop and form_id_prop.get("rich_text"):
-            fid = (form_id_prop["rich_text"][0].get("plain_text") or "").strip()
-        if fid:
-            form_ids.add(fid)
-    print(f"(Gateway) formIds détectés: {sorted(form_ids)}")
-
-    all_emails: Set[str] = set()
-    for fid in form_ids:
-        all_emails |= get_form_emails_from_gateway_by_id(fid)
-    print(f"(Gateway) emails récupérés: {len(all_emails)}")
-    if not all_emails:
-        print("(Gateway) Aucun email récupéré depuis les Forms référencés en Notion")
-    return all_emails
+# --- Helpers Notion ----------------------------------------------------------
+async def _fetch_all_pages(notion: AsyncClient) -> List[dict]:
+    """Récupère toutes les pages de la DB (pagination)."""
+    results: List[dict] = []
+    start_cursor = None
+    while True:
+        resp = await notion.databases.query(
+            database_id=str(NOTION_DATABASE_ID), start_cursor=start_cursor
+        )
+        results.extend(resp.get("results", []))
+        if not resp.get("has_more"):
+            break
+        start_cursor = resp.get("next_cursor")
+    return results
 
 
-# --------------------------- Messenger ---------------------------
-def send_message(psid: str | None, text: str) -> None:
-    if psid is None:
-        print("⚠️ PSID manquant, message non envoyé")
-        return
-    if PAGE_TOKEN is None:
-        print("⚠️ PAGE_TOKEN manquant, message non envoyé")
-        return
-    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={PAGE_TOKEN}"
-    payload = {
-        "recipient": {"id": psid},
-        "message": {"text": text},
-        "tag": "CONFIRMED_EVENT_UPDATE",
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            print(f"❌ Erreur API: {r.status_code} - {r.text}")
-        else:
-            print(f"✅ Message envoyé à {psid}")
-    except Exception as e:
-        print(f"❌ Exception lors de l'envoi: {e}")
+def _extract_prop_text(props: dict, name: str) -> str | None:
+    p = props.get(name)
+    if not isinstance(p, dict):
+        return None
+    if p.get("rich_text"):
+        return (p["rich_text"][0].get("plain_text") or "").strip()
+    if p.get("title"):
+        return (p["title"][0].get("plain_text") or "").strip()
+    if p.get("url"):
+        return (p.get("url") or "").strip()
+    return None
 
 
-# --------------------------- Flux Notion ---------------------------
+def _extract_prop_email(props: dict, name: str = "Email") -> str | None:
+    p = props.get(name)
+    if isinstance(p, dict) and p.get("email"):
+        return (p.get("email") or "").strip().lower()
+    return None
+
+
+def _extract_prop_checkbox(props: dict, name: str) -> bool:
+    p = props.get(name)
+    if isinstance(p, dict):
+        return bool(p.get("checkbox", False))
+    return False
+
+
+# --- SYNC: Forms -> Notion ---------------------------------------------------
 async def sync_notion_checkbox_from_forms() -> int:
-    """Coche la case 'A répondu' pour les emails présents dans les réponses de Form."""
+    """Coche 'A répondu' si — et seulement si — l'email a répondu AU form lié à la ligne."""
     notion = AsyncClient(auth=NOTION_TOKEN)
     try:
-        # Construire un mapping {formId: set(emails)}
-        resp_forms = await notion.databases.query(database_id=str(NOTION_DATABASE_ID))
-        form_id_to_emails = {}
-        for page in resp_forms.get("results", []):
-            props = page.get("properties", {})
-            form_id_prop = props.get("Form ID")
-            fid = None
-            if form_id_prop and form_id_prop.get("rich_text"):
-                fid = (form_id_prop["rich_text"][0].get("plain_text") or "").strip()
-            if fid and fid not in form_id_to_emails:
-                form_id_to_emails[fid] = get_form_emails_from_gateway_by_id(fid)
+        pages = await _fetch_all_pages(notion)
 
-        if not form_id_to_emails:
+        # Collecte des Form IDs uniques présents en DB
+        unique_fids: Set[str] = set()
+        for page in pages:
+            props = page.get("properties", {})
+            fid = _extract_prop_text(props, "Form ID")
+            if fid:
+                unique_fids.add(fid)
+
+        if not unique_fids:
             print("(Sync) Aucun Form ID détecté dans Notion — synchro ignorée")
             return 0
 
-        resp = await notion.databases.query(database_id=str(NOTION_DATABASE_ID))
-        results = resp.get("results", [])
+        # Récupération des emails par Form ID en parallèle (I/O bound)
+        form_id_to_emails: Dict[str, Set[str]] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(unique_fids))) as pool:
+            futures = {pool.submit(get_form_emails_from_gateway_by_id, fid): fid for fid in unique_fids}
+            for fut in as_completed(futures):
+                fid = futures[fut]
+                try:
+                    form_id_to_emails[fid] = fut.result() or set()
+                except Exception as e:
+                    print(f"(Gateway) Erreur pour formId={fid}: {e}")
+                    form_id_to_emails[fid] = set()
+
+        print(f"(Gateway) formIds détectés: {sorted(unique_fids)}")
+        total_emails = sum(len(v) for v in form_id_to_emails.values())
+        print(f"(Gateway) emails récupérés (agrégés): {total_emails}")
+
         updated = 0
         matched = 0
-        for page in results:
+
+        for page in pages:
             props = page.get("properties", {})
+            email = _extract_prop_email(props, "Email")
+            fid = _extract_prop_text(props, "Form ID")
+            answered = _extract_prop_checkbox(props, "A répondu")
 
-            email_prop = props.get("Email")
-            email = email_prop.get("email") if isinstance(email_prop, dict) else None
+            if not (email and fid):
+                continue
 
-            # Extraire le Form ID pour cette ligne
-            form_id_prop = props.get("Form ID")
-            fid = None
-            if form_id_prop and form_id_prop.get("rich_text"):
-                fid = (form_id_prop["rich_text"][0].get("plain_text") or "").strip()
             emails_for_form = form_id_to_emails.get(fid, set())
-
-            answered_prop = props.get("A répondu")
-            answered = answered_prop.get("checkbox", False) if isinstance(answered_prop, dict) else False
-
-            if email and email.lower() in emails_for_form:
+            if email in emails_for_form:
                 matched += 1
                 if not answered:
-                    page_id = page["id"]
-                    await notion.pages.update(page_id=page_id, properties={"A répondu": {"checkbox": True}})
-                    updated += 1
+                    # Coche la case
+                    try:
+                        await notion.pages.update(
+                            page_id=page["id"],
+                            properties={"A répondu": {"checkbox": True}},
+                        )
+                        updated += 1
+                    except Exception as e:
+                        print(f"(Sync) Erreur mise à jour page {page.get('id')}: {e}")
+
         print(f"(Sync) {matched} correspondances trouvées. {updated} nouvelles réponses mises à jour dans Notion")
         return updated
     finally:
-        pass
+        # Graceful close (handles libraries without .close or with sync/async close)
+        try:
+            maybe_close = getattr(notion, "close", None) or getattr(notion, "aclose", None)
+            if callable(maybe_close):
+                result = maybe_close()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass
+
+
+# --- SEND: Notion -> Messenger ----------------------------------------------
+def _fb_send_message(psid: str, text: str) -> bool:
+    if not PAGE_TOKEN:
+        print("(Send) PAGE_TOKEN manquant — envoi ignoré")
+        return False
+    url = "https://graph.facebook.com/v17.0/me/messages"
+    payload = {"recipient": {"id": psid}, "message": {"text": text}}
+    try:
+        resp = requests.post(url, params={"access_token": PAGE_TOKEN}, json=payload, timeout=20)
+        ok = resp.ok
+        if not ok:
+            print(f"(Send) Erreur API FB {resp.status_code}: {resp.text}")
+        return ok
+    except Exception as e:
+        print(f"(Send) Exception API FB: {e}")
+        return False
 
 
 async def send_reminders() -> int:
-    """Envoie les rappels aux entrées Notion avec 'A répondu' == False."""
+    """Envoie des rappels aux lignes sans 'A répondu' et avec PSID présent."""
     notion = AsyncClient(auth=NOTION_TOKEN)
+    sent = 0
     try:
-        resp = await notion.databases.query(database_id=str(NOTION_DATABASE_ID))
-        results = resp.get("results", [])
-        sent = 0
-        for page in results:
+        pages = await _fetch_all_pages(notion)
+        for page in pages:
             props = page.get("properties", {})
+            answered = _extract_prop_checkbox(props, "A répondu")
+            if answered:
+                continue
+            # Besoin d'un PSID + lien Form pour un rappel utile
+            psid = _extract_prop_text(props, "PSID")
+            form_link = _extract_prop_text(props, "Form Link")
+            sent_date = _extract_prop_text(props, "Date d'envoi") or _extract_prop_text(props, "Date d’envoi")
+            email = _extract_prop_email(props, "Email") or ""
 
-            email_prop = props.get("Email")
-            email = email_prop.get("email") if isinstance(email_prop, dict) else None
+            if not psid:
+                continue
 
-            psid_prop = props.get("PSID")
-            psid = psid_prop["rich_text"][0]["plain_text"] if psid_prop and psid_prop.get("rich_text") else None
+            # Compose le message
+            date_txt = sent_date or "(date non renseignée)"
+            link_txt = form_link or "(Pas de lien fourni)"
+            msg = (
+                f"Bonjour 👋, tu n’as pas encore rempli le formulaire envoyé le {date_txt}.\n"
+                f"Merci de le remplir ici : {link_txt}"
+            )
 
-            # IMPORTANT: URL publique à envoyer aux membres
-            form_link_prop = props.get("Form Link")
-            form_link = form_link_prop.get("url") if isinstance(form_link_prop, dict) else None
-
-            answered_prop = props.get("A répondu")
-            answered = answered_prop.get("checkbox", False) if isinstance(answered_prop, dict) else False
-
-            date_prop = props.get("Date envoi")
-            date_field = date_prop.get("date") if isinstance(date_prop, dict) else None
-            date_envoi = date_field.get("start") if isinstance(date_field, dict) else None
-
-            last_reminder_prop = props.get("Dernier rappel")
-            last_reminder_field = last_reminder_prop.get("date") if isinstance(last_reminder_prop, dict) else None
-            last_reminder = last_reminder_field.get("start") if isinstance(last_reminder_field, dict) else None
-
-            # Règle d’intervalle minimal
-            skip_due_to_interval = False
-            if MIN_REMINDER_DAYS and last_reminder:
-                try:
-                    lr_dt = datetime.datetime.fromisoformat(last_reminder.replace("Z", "+00:00"))
-                    now_dt = datetime.datetime.now(datetime.timezone.utc)
-                    delta_days = (now_dt - lr_dt).days
-                    if delta_days < MIN_REMINDER_DAYS:
-                        skip_due_to_interval = True
-                except Exception:
-                    skip_due_to_interval = False
-
-            if (not answered) and not skip_due_to_interval:
-                # Construire le message
-                date_txt = date_envoi or ""
-                link_txt = form_link or "(Pas de lien fourni)"
-                message = (
-                    f"Message for {email} ({psid}):\n"
-                    f"Bonjour 👋, tu n’as pas encore rempli le formulaire envoyé le {date_txt}.\n"
-                    f"Merci de le remplir ici : {link_txt}"
-                )
-                print(message)
-
-                if DRY_RUN:
-                    print("[DRY_RUN] Envoi simulé — aucun message réellement envoyé.")
-                else:
-                    send_message(psid, message)
-                    # Mettre à jour 'Dernier rappel'
-                    try:
-                        page_id = page["id"]
-                        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        await notion.pages.update(page_id=page_id, properties={
-                            "Dernier rappel": {"date": {"start": now_iso}}
-                        })
-                    except Exception as e:
-                        print(f"⚠️ Impossible de mettre à jour 'Dernier rappel' : {e}")
+            if DRY_RUN:
+                print(f"(DRY_RUN) [PSID={psid}] {msg}")
+                sent += 1
+            else:
+                if _fb_send_message(psid, msg):
                     sent += 1
-
-                if RATE_LIMIT_MS:
-                    await asyncio.sleep(RATE_LIMIT_MS / 1000.0)
-
-        mode = "simulation" if DRY_RUN else "réel"
-        print(f"(Send) Rappels envoyés ({mode}) : {sent}")
+                    if RATE_LIMIT_MS > 0:
+                        time.sleep(RATE_LIMIT_MS / 1000.0)
+        print(f"(Send) Rappels envoyés : {sent}")
         return sent
     finally:
-        pass
+        # Graceful close (handles libraries without .close or with sync/async close)
+        try:
+            maybe_close = getattr(notion, "close", None) or getattr(notion, "aclose", None)
+            if callable(maybe_close):
+                result = maybe_close()
+                if asyncio.iscoroutine(result):
+                    await result
+        except Exception:
+            pass
 
 
-# --------------------------- Wrappers sync pour Streamlit ---------------------------
+# --- Wrappers synchrones pour app.py (/admin) -------------------------------
 def run_sync_from_forms_sync() -> int:
-    """Wrapper synchrone pour Streamlit : retourne le nombre de cases mises à jour."""
-    try:
-        return asyncio.run(sync_notion_checkbox_from_forms())
-    except RuntimeError as e:
-        if "asyncio.run() cannot be called from a running event loop" in str(e):
-            loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-                return loop.run_until_complete(sync_notion_checkbox_from_forms())
-            finally:
-                loop.close()
-        raise
+    return asyncio.run(sync_notion_checkbox_from_forms())
 
 
 def run_send_reminders_sync() -> int:
-    """Wrapper synchrone pour Streamlit : retourne le nombre de rappels envoyés."""
-    try:
-        return asyncio.run(send_reminders())
-    except RuntimeError as e:
-        if "asyncio.run() cannot be called from a running event loop" in str(e):
-            loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(loop)
-                return loop.run_until_complete(send_reminders())
-            finally:
-                loop.close()
-        raise
-
-
-# Exécution directe (debug)
-if __name__ == "__main__":
-    async def main():
-        up = await sync_notion_checkbox_from_forms()
-        se = await send_reminders()
-        print(f"(Done) sync_updated={up}, sent={se}")
-    asyncio.run(main())
+    return asyncio.run(send_reminders())
