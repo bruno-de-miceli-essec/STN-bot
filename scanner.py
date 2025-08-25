@@ -6,10 +6,9 @@ import time
 from typing import Dict, List, Set, Optional, cast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from db import SessionLocal
+from db import SessionLocal, init_db
 from models import Form, Response
 from datetime import datetime
-from db import init_db
 
 init_db()
 
@@ -46,6 +45,68 @@ def get_form_emails_from_gateway_by_id(form_id: str) -> Set[str]:
     except Exception as e:
         print(f"(Gateway) Erreur lors de la récupération des emails pour formId={form_id}: {e}")
         return set()
+
+# Nouveau parseur: renvoie { email: submitted_at_datetime_or_None }
+from datetime import datetime
+
+def _parse_ts(val: str | None) -> Optional[datetime]:
+    if not val:
+        return None
+    try:
+        # essais ISO simples
+        return datetime.fromisoformat(val.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def get_form_email_map_from_gateway(form_id: str) -> Dict[str, Optional[datetime]]:
+    mapping: Dict[str, Optional[datetime]] = {}
+    if not FORMS_GATEWAY_URL or not form_id:
+        return mapping
+    try:
+        resp = requests.get(FORMS_GATEWAY_URL, params={"formId": form_id}, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        # cas 1: liste simple ["a@x", "b@y"]
+        if isinstance(data, list) and all(not isinstance(x, dict) for x in data):
+            for x in data:
+                em = str(x).strip().lower()
+                if em:
+                    mapping[em] = None
+            return mapping
+        # cas 2: liste d'objets
+        if isinstance(data, list):
+            for obj in data:
+                if not isinstance(obj, dict):
+                    continue
+                em = str(obj.get("email", "")).strip().lower()
+                ts = _parse_ts(obj.get("submitted_at") or obj.get("timestamp") or obj.get("ts"))
+                if em:
+                    mapping[em] = ts
+            return mapping
+        # cas 3: objet avec clés utiles
+        if isinstance(data, dict):
+            # chercher une clé qui contient la liste
+            for key in ("items", "rows", "emails", "data", "responses"):
+                if key in data:
+                    inner = data[key]
+                    if isinstance(inner, list):
+                        # réutilise la logique liste
+                        if inner and isinstance(inner[0], dict):
+                            for obj in inner:
+                                em = str(obj.get("email", "")).strip().lower()
+                                ts = _parse_ts(obj.get("submitted_at") or obj.get("timestamp") or obj.get("ts"))
+                                if em:
+                                    mapping[em] = ts
+                        else:
+                            for x in inner:
+                                em = str(x).strip().lower()
+                                if em:
+                                    mapping[em] = None
+                        return mapping
+        return mapping
+    except Exception as e:
+        print(f"(Gateway) Erreur lors de la récupération (map) pour formId={form_id}: {e}")
+        return mapping
 
 
 # --- Helpers Notion ----------------------------------------------------------
@@ -107,21 +168,28 @@ def _ensure_forms_in_db_from_pages(pages: List[dict]) -> Dict[str, int]:
                 db.add(existing)
                 db.commit()
                 db.refresh(existing)
+            title = _extract_prop_text(props, "Nom du formulaire")
+            # Pylance/SQLAlchemy: ne pas évaluer directement existing.title en booléen
+            cur_title: Optional[str] = cast(Optional[str], getattr(existing, "title"))
+            if (title is not None) and (cur_title != title):
+                setattr(existing, "title", title)
+                db.commit()
             # existing.id is an int at runtime but SQLAlchemy typings mark it as Column[int]; cast explicitly
             if existing.id is not None:
                 mapping[fid] = int(cast(int, existing.id))
     return mapping
 
-def _insert_new_responses(form_db_id: int, emails: Set[str]) -> int:
+def _insert_new_responses_map(form_db_id: int, email_map: Dict[str, Optional[datetime]]) -> int:
     """Insère en DB uniquement les nouvelles réponses (par email) pour un form donné."""
-    if not emails:
+    if not email_map:
         return 0
     new_count = 0
     with SessionLocal() as db:
         known: Set[str] = {str(r.email) for r in db.query(Response).filter(Response.form_id == form_db_id)}
-        to_add: Set[str] = set(emails) - known
+        to_add: Set[str] = set(email_map.keys()) - known
         for em in to_add:
-            db.add(Response(form_id=form_db_id, email=em, submitted_at=datetime.utcnow()))
+            ts = email_map.get(em) or datetime.utcnow()
+            db.add(Response(form_id=form_db_id, email=em, submitted_at=ts))
         if to_add:
             db.commit()
             new_count = len(to_add)
@@ -168,33 +236,34 @@ async def sync_notion_checkbox_from_forms() -> int:
             return 0
 
         # Récupération des emails par Form ID en parallèle (I/O bound)
-        form_id_to_emails: Dict[str, Set[str]] = {}
+        form_id_to_maps: Dict[str, Dict[str, Optional[datetime]]] = {}
         with ThreadPoolExecutor(max_workers=min(8, len(unique_fids))) as pool:
-            futures = {pool.submit(get_form_emails_from_gateway_by_id, fid): fid for fid in unique_fids}
+            futures = {pool.submit(get_form_email_map_from_gateway, fid): fid for fid in unique_fids}
             for fut in as_completed(futures):
                 fid = futures[fut]
                 try:
-                    form_id_to_emails[fid] = fut.result() or set()
+                    form_id_to_maps[fid] = fut.result() or {}
                 except Exception as e:
                     print(f"(Gateway) Erreur pour formId={fid}: {e}")
-                    form_id_to_emails[fid] = set()
+                    form_id_to_maps[fid] = {}
 
         print(f"(Gateway) formIds détectés: {sorted(unique_fids)}")
-        total_emails = sum(len(v) for v in form_id_to_emails.values())
+        total_emails = sum(len(v) for v in form_id_to_maps.values())
         print(f"(Gateway) emails récupérés (agrégés): {total_emails}")
 
         # S’assurer que les forms existent en DB et enregistrer les nouvelles réponses
         fid_to_dbid = _ensure_forms_in_db_from_pages(pages)
         saved_total = 0
-        for fid, emails_set in form_id_to_emails.items():
+        for fid, email_map in form_id_to_maps.items():
             dbid = fid_to_dbid.get(fid)
             if dbid:
-                saved_total += _insert_new_responses(dbid, emails_set)
+                saved_total += _insert_new_responses_map(dbid, email_map)
         print(f"(DB) Nouvelles réponses sauvegardées: {saved_total}")
 
         updated = 0
         matched = 0
-        for fid, emails_set in form_id_to_emails.items():
+        for fid, email_map in form_id_to_maps.items():
+            emails_set = set(email_map.keys())
             matched += len(emails_set)
             updated += await _update_notion_checkboxes_for_fid(notion, pages, fid, emails_set)
 
@@ -306,10 +375,10 @@ async def _sync_single_form(form_db_id: int) -> int:
         # Fetch pages Notion (une fois) puis ne traiter que ce fid
         pages = await _fetch_all_pages(notion)
         fid_str = str(fid)
-        emails_set = get_form_emails_from_gateway_by_id(fid_str)
-        saved = _insert_new_responses(form_db_id, emails_set)
+        email_map = get_form_email_map_from_gateway(fid_str)
+        saved = _insert_new_responses_map(form_db_id, email_map)
         # MAJ Notion uniquement pour ce fid
-        updated = await _update_notion_checkboxes_for_fid(notion, pages, fid_str, emails_set)
+        updated = await _update_notion_checkboxes_for_fid(notion, pages, fid_str, set(email_map.keys()))
         print(f"(Sync single) fid={fid_str}: saved={saved}, updated={updated}")
         return updated
     finally:
@@ -329,5 +398,5 @@ def get_forms_summary() -> List[dict]:
         out = []
         for f in db.query(Form).all():
             cnt = db.query(Response).filter(Response.form_id == f.id).count()
-            out.append({"id": f.id, "google_form_id": f.google_form_id, "responses_count": cnt})
+            out.append({"id": f.id, "google_form_id": f.google_form_id, "title": f.title or "", "responses_count": cnt})
         return out
