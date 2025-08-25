@@ -1,5 +1,6 @@
 import streamlit as st
 import scanner as s
+import os
 
 st.title("STN Bot Dashboard")
 
@@ -12,3 +13,5 @@ if st.button("Envoyer les rappels"):
     with st.spinner("Envoi en cours..."):
         sent = s.run_send_reminders_sync()
     st.success(f"{sent} rappels envoyés")
+
+
