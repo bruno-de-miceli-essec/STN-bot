@@ -31,7 +31,7 @@ def notion_webhook():
 
     if not psid:
         return jsonify({"error": "Missing psid"}), 400
-
+    print(psid)
     status, response_text = send_message(psid, message)
     return jsonify({"status": status, "response": response_text}), status
 
