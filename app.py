@@ -1,112 +1,87 @@
 import os
 import requests
-from quart import make_response, Response, Quart, request, jsonify
+from flask import Flask, request, abort
 from dotenv import load_dotenv
 
-# Chargement des variables d’environnement
 load_dotenv()
 
-app = Quart(__name__)
-
-# === CONSTANTES ===
-VERIFY_TOKEN = os.getenv("FB_VERIFY_TOKEN")
-PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
+NOTION_WEBHOOK_SECRET = os.getenv("NOTION_WEBHOOK_SECRET")
+NOTION_PEOPLE_DB_ID = os.getenv("NOTION_PEOPLE_DB_ID")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_RESPONSES_DATABASE_ID = os.getenv("NOTION_RESPONSES_DATABASE_ID")
+PAGE_TOKEN = os.getenv("PAGE_TOKEN")
 
-NOTION_HEADERS = {
+app = Flask(__name__)
+
+HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
     "Notion-Version": "2022-06-28"
 }
 
-
-# === UTILS ===
-def send_messenger_message(psid, message):
-    url = "https://graph.facebook.com/v18.0/me/messages"
-    params = {"access_token": PAGE_ACCESS_TOKEN}
+def get_unchecked_people():
+    url = f"https://api.notion.com/v1/databases/{NOTION_PEOPLE_DB_ID}/query"
     payload = {
-        "recipient": {"id": psid},
-        "message": {"text": message}
+        "filter": {
+            "property": "Rappel envoyé",
+            "checkbox": {
+                "equals": False
+            }
+        }
     }
+    response = requests.post(url, headers=HEADERS, json=payload)
+    response.raise_for_status()
+    return response.json().get("results", [])
+
+def get_messenger_id(notion_user):
+    props = notion_user["properties"]
+    messenger_prop = props.get("Messenger ID")
+    if messenger_prop and messenger_prop.get("rich_text"):
+        return messenger_prop["rich_text"][0]["plain_text"]
+    return None
+
+def mark_as_reminded(page_id):
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    payload = {
+        "properties": {
+            "Rappel envoyé": {
+                "checkbox": True
+            }
+        }
+    }
+    response = requests.patch(url, headers=HEADERS, json=payload)
+    response.raise_for_status()
+
+def send_message(psid, text):
+    url = "https://graph.facebook.com/v17.0/me/messages"
+    payload = {
+        "messaging_type": "UPDATE",
+        "recipient": {"id": psid},
+        "message": {"text": text}
+    }
+    params = {"access_token": PAGE_TOKEN}
     response = requests.post(url, params=params, json=payload)
-    if response.status_code != 200:
-        print(f"❌ Erreur lors de l’envoi à {psid} : {response.text}")
-    else:
-        print(f"✅ Message envoyé à {psid}")
-
-
-def query_notion_database(database_id):
-    url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    response = requests.post(url, headers=NOTION_HEADERS)
-    if response.status_code != 200:
-        raise Exception(f"❌ Requête Notion échouée : {response.text}")
-    return response.json()
-
-
-# === ROUTES ===
+    response.raise_for_status()
 
 @app.route("/", methods=["GET"])
-async def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+def index():
+    return "App is running!"
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Webhook vérifié")
-        return await make_response(challenge, 200)
-    else:
-        print("❌ Échec de la vérification du webhook")
-        return await make_response("Forbidden", 403)
+@app.route("/notion-webhook", methods=["POST"])
+def notion_webhook():
+    if request.headers.get("Authorization") != NOTION_WEBHOOK_SECRET:
+        abort(401)
 
-
-@app.route("/webhook", methods=["POST"])
-async def handle_messages():
-    data = await request.get_json()
-    for entry in data.get("entry", []):
-        for messaging_event in entry.get("messaging", []):
-            if messaging_event.get("message"):
-                sender_id = messaging_event["sender"]["id"]
-                message_text = messaging_event["message"].get("text", "")
-                print(f"📩 Message reçu de {sender_id} : {message_text}")
-                send_messenger_message(sender_id, "Merci pour ton message 😇")
-    return jsonify(status="ok")
-
-
-@app.route("/forms-trigger", methods=["POST"])
-async def handle_forms_trigger():
-    print("🚀 Webhook Forms Trigger reçu")
-    await check_responses_and_send_messages()
-    return jsonify(status="messages sent")
-
-
-# === LOGIQUE PRINCIPALE ===
-async def check_responses_and_send_messages():
-    print("📥 Lancement de check_responses_and_send_messages()")
-    try:
-        data = query_notion_database(NOTION_RESPONSES_DATABASE_ID)
-        results = data.get("results", [])
-        print(f"🔍 {len(results)} entrées trouvées dans Notion")
-
-        for result in results:
+    people = get_unchecked_people()
+    for person in people:
+        psid = get_messenger_id(person)
+        if psid:
             try:
-                props = result["properties"]
-                psid = props["psid"]["rich_text"][0]["plain_text"]
-                has_not_replied = props["n'a pas répondu"]["checkbox"]
-
-                if has_not_replied:
-                    message = "N'oublie pas de remplir le formulaire 😇"
-                    send_messenger_message(psid, message)
-                    print(f"📤 Message envoyé à {psid}")
-                else:
-                    print(f"✔️ {psid} a déjà répondu, aucun message envoyé.")
-
+                send_message(psid, "Petit rappel pour compléter le formulaire !")
+                mark_as_reminded(person["id"])
             except Exception as e:
-                print(f"⚠️ Erreur lors du traitement d’une ligne : {e}")
+                print(f"Erreur pour {psid}: {e}")
 
-    except Exception as e:
-        print(f"❌ Erreur globale dans check_responses_and_send_messages : {e}")
+    return "OK", 200
 
-
-# === LANCEMENT LOCAL ===
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=True)
