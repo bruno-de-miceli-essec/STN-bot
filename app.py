@@ -1,80 +1,112 @@
-from flask import Flask, request, jsonify
-import requests
 import os
+import requests
+from quart import make_response, Response, Quart, request, jsonify
+from dotenv import load_dotenv
 
-def send_messages_to_unanswered():
-    NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-    DATABASE_ID = os.getenv("NOTION_RESPONSES_DB_ID")
+# Chargement des variables d’environnement
+load_dotenv()
 
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
+app = Quart(__name__)
 
-    query_url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
-    response = requests.post(query_url, headers=headers)
-    if response.status_code != 200:
-        print("Failed to fetch Notion database:", response.text)
-        return
+# === CONSTANTES ===
+VERIFY_TOKEN = os.getenv("FB_VERIFY_TOKEN")
+PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_RESPONSES_DATABASE_ID = os.getenv("NOTION_RESPONSES_DATABASE_ID")
 
-    results = response.json().get("results", [])
-    for page in results:
-        props = page.get("properties", {})
-        psid_field = props.get("PSID", {}).get("rich_text", [])
-        reponse_checkbox = props.get("n'a pas répondu", {}).get("checkbox", False)
+NOTION_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Notion-Version": "2022-06-28"
+}
 
-        if reponse_checkbox and psid_field and "plain_text" in psid_field[0]:
-            psid = psid_field[0]["plain_text"]
-            print(f"Sending message to PSID: {psid}")
-            send_message(psid, "Tu n’as pas encore répondu au formulaire !")
 
-app = Flask(__name__)
-
-# Clé API Messenger (stockée dans les variables d'env Render)
-PAGE_TOKEN = os.getenv("PAGE_TOKEN")
-
-@app.route('/')
-def home():
-    return '✅ Server is running!'
-
-def send_message(psid, message):
-    url = f"https://graph.facebook.com/v18.0/me/messages?access_token={PAGE_TOKEN}"
+# === UTILS ===
+def send_messenger_message(psid, message):
+    url = "https://graph.facebook.com/v18.0/me/messages"
+    params = {"access_token": PAGE_ACCESS_TOKEN}
     payload = {
         "recipient": {"id": psid},
         "message": {"text": message}
     }
-    response = requests.post(url, json=payload)
-    return response.status_code, response.text
-
-@app.route("/notion-webhook", methods=["POST"])
-def notion_webhook():
-    print("Webhook Notion reçu")
-    data = request.json
-    print(data)
-    if not data:
-        return jsonify({"error": "No JSON payload received"}), 400
-
-    notion_psid = data.get("data", {}).get("properties", {}).get("PSID", {}).get("rich_text", [])
-    if notion_psid and "plain_text" in notion_psid[0]:
-        psid = notion_psid[0]["plain_text"]
+    response = requests.post(url, params=params, json=payload)
+    if response.status_code != 200:
+        print(f"❌ Erreur lors de l’envoi à {psid} : {response.text}")
     else:
-        print("PSID not found in payload")
-        return jsonify({"status": "PSID missing"}), 400
-
-    message = data.get("message", "Hello from Notion!")
-
-    print("psid",psid)
-    status, response_text = send_message(psid, message)
-    return jsonify({"status": status, "response": response_text}), status
-
-if __name__ == "__main__":
-    app.run(debug=True)
+        print(f"✅ Message envoyé à {psid}")
 
 
-# Route pour déclencher l'envoi aux non-répondants
+def query_notion_database(database_id):
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    response = requests.post(url, headers=NOTION_HEADERS)
+    if response.status_code != 200:
+        raise Exception(f"❌ Requête Notion échouée : {response.text}")
+    return response.json()
+
+
+# === ROUTES ===
+
+@app.route("/", methods=["GET"])
+async def verify_webhook():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        print("✅ Webhook vérifié")
+        return await make_response(challenge, 200)
+    else:
+        print("❌ Échec de la vérification du webhook")
+        return await make_response("Forbidden", 403)
+
+
+@app.route("/webhook", methods=["POST"])
+async def handle_messages():
+    data = await request.get_json()
+    for entry in data.get("entry", []):
+        for messaging_event in entry.get("messaging", []):
+            if messaging_event.get("message"):
+                sender_id = messaging_event["sender"]["id"]
+                message_text = messaging_event["message"].get("text", "")
+                print(f"📩 Message reçu de {sender_id} : {message_text}")
+                send_messenger_message(sender_id, "Merci pour ton message 😇")
+    return jsonify(status="ok")
+
+
 @app.route("/forms-trigger", methods=["POST"])
-def forms_trigger():
-    print("Webhook Forms reçu")
-    send_messages_to_unanswered()
-    return jsonify({"status": "messages sent"})
+async def handle_forms_trigger():
+    print("🚀 Webhook Forms Trigger reçu")
+    await check_responses_and_send_messages()
+    return jsonify(status="messages sent")
+
+
+# === LOGIQUE PRINCIPALE ===
+async def check_responses_and_send_messages():
+    print("📥 Lancement de check_responses_and_send_messages()")
+    try:
+        data = query_notion_database(NOTION_RESPONSES_DATABASE_ID)
+        results = data.get("results", [])
+        print(f"🔍 {len(results)} entrées trouvées dans Notion")
+
+        for result in results:
+            try:
+                props = result["properties"]
+                psid = props["psid"]["rich_text"][0]["plain_text"]
+                has_not_replied = props["n'a pas répondu"]["checkbox"]
+
+                if has_not_replied:
+                    message = "N'oublie pas de remplir le formulaire 😇"
+                    send_messenger_message(psid, message)
+                    print(f"📤 Message envoyé à {psid}")
+                else:
+                    print(f"✔️ {psid} a déjà répondu, aucun message envoyé.")
+
+            except Exception as e:
+                print(f"⚠️ Erreur lors du traitement d’une ligne : {e}")
+
+    except Exception as e:
+        print(f"❌ Erreur globale dans check_responses_and_send_messages : {e}")
+
+
+# === LANCEMENT LOCAL ===
+if __name__ == "__main__":
+    app.run()
