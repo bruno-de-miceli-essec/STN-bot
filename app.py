@@ -27,11 +27,16 @@ def notion_webhook():
     print(data)
     if not data:
         return jsonify({"error": "No JSON payload received"}), 400
-    psid = data.get("PSID")
+
+    notion_psid = data.get("data", {}).get("properties", {}).get("PSID", {}).get("rich_text", [])
+    if notion_psid and "plain_text" in notion_psid[0]:
+        psid = notion_psid[0]["plain_text"]
+    else:
+        print("PSID not found in payload")
+        return jsonify({"status": "PSID missing"}), 400
+
     message = data.get("message", "Hello from Notion!")
 
-    if not psid:
-        return jsonify({"error": "Missing psid"}), 400
     print("psid",psid)
     status, response_text = send_message(psid, message)
     return jsonify({"status": status, "response": response_text}), status
