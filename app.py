@@ -1,9 +1,13 @@
+from flask import Flask, request, jsonify
+import requests
+import os
+
 def send_messages_to_unanswered():
-    NOTION_API_KEY = os.getenv("NOTION_API_KEY")
-    DATABASE_ID = os.getenv("NOTION_RESPONSES_DB")
+    NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+    DATABASE_ID = os.getenv("NOTION_RESPONSES_DB_ID")
 
     headers = {
-        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json"
     }
@@ -24,9 +28,6 @@ def send_messages_to_unanswered():
             psid = psid_field[0]["plain_text"]
             print(f"Sending message to PSID: {psid}")
             send_message(psid, "Tu n’as pas encore répondu au formulaire !")
-from flask import Flask, request, jsonify
-import requests
-import os
 
 app = Flask(__name__)
 
