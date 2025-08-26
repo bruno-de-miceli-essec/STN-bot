@@ -1,59 +1,33 @@
-# scanner.py — logique Notion + Forms + envoi Messenger
+# scanner.py — Notion-only logic (Option A)
 from __future__ import annotations
 import os
 import asyncio
 import time
-from typing import Dict, List, Set, Optional, cast
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from db import SessionLocal, init_db
-from models import Form, Response
+from typing import Dict, List, Set, Optional
 from datetime import datetime
-
-init_db()
 
 import requests
 from notion_client import AsyncClient
 
-# --- Configuration via variables d'environnement ---
+# --- Env ---
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-FORMS_GATEWAY_URL = os.getenv("FORMS_GATEWAY_URL")  # Apps Script /exec qui renvoie des emails par formId
+NOTION_FORMS_DB_ID = os.getenv("NOTION_FORMS_DB_ID")
+NOTION_PEOPLE_DB_ID = os.getenv("NOTION_PEOPLE_DB_ID")
+NOTION_RESPONSES_DB_ID = os.getenv("NOTION_RESPONSES_DB_ID")
+FORMS_GATEWAY_URL = os.getenv("FORMS_GATEWAY_URL")  # Apps Script /exec?formId=...
 PAGE_TOKEN = os.getenv("PAGE_TOKEN")
 
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-MIN_REMINDER_DAYS = int(os.getenv("MIN_REMINDER_DAYS", "0"))  # réservé si tu veux filtrer selon une date
-RATE_LIMIT_MS = int(os.getenv("RATE_LIMIT_MS", "0"))  # délai entre envois pour FB
+RATE_LIMIT_MS = int(os.getenv("RATE_LIMIT_MS", "0"))
 
-if not NOTION_TOKEN or not NOTION_DATABASE_ID:
-    # Laisse passer l'import côté app.py, mais garde une info utile pour /admin
-    print("[scanner] WARN: NOTION_TOKEN/NOTION_DATABASE_ID non définis")
+if not NOTION_TOKEN:
+    print("[scanner] WARN: NOTION_TOKEN manquant")
 
-
-# --- Helpers Forms -----------------------------------------------------------
-def get_form_emails_from_gateway_by_id(form_id: str) -> Set[str]:
-    """Appelle la gateway Apps Script pour récupérer les emails d'un form donné.
-    Retourne un set d'emails (lowercased)."""
-    if not FORMS_GATEWAY_URL or not form_id:
-        return set()
-    try:
-        resp = requests.get(FORMS_GATEWAY_URL, params={"formId": form_id}, timeout=20)
-        resp.raise_for_status()
-        data = resp.json() or []
-        emails = {str(x).strip().lower() for x in data if x}
-        return emails
-    except Exception as e:
-        print(f"(Gateway) Erreur lors de la récupération des emails pour formId={form_id}: {e}")
-        return set()
-
-# Nouveau parseur: renvoie { email: submitted_at_datetime_or_None }
-from datetime import datetime
-
+# --- Gateway parsing ---
 def _parse_ts(val: str | None) -> Optional[datetime]:
     if not val:
         return None
     try:
-        # essais ISO simples
         return datetime.fromisoformat(val.replace("Z", "+00:00"))
     except Exception:
         return None
@@ -66,14 +40,14 @@ def get_form_email_map_from_gateway(form_id: str) -> Dict[str, Optional[datetime
         resp = requests.get(FORMS_GATEWAY_URL, params={"formId": form_id}, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        # cas 1: liste simple ["a@x", "b@y"]
+        # list of strings
         if isinstance(data, list) and all(not isinstance(x, dict) for x in data):
             for x in data:
                 em = str(x).strip().lower()
                 if em:
                     mapping[em] = None
             return mapping
-        # cas 2: liste d'objets
+        # list of objects
         if isinstance(data, list):
             for obj in data:
                 if not isinstance(obj, dict):
@@ -83,303 +57,197 @@ def get_form_email_map_from_gateway(form_id: str) -> Dict[str, Optional[datetime
                 if em:
                     mapping[em] = ts
             return mapping
-        # cas 3: objet avec clés utiles
+        # object with key holding the list
         if isinstance(data, dict):
-            # chercher une clé qui contient la liste
             for key in ("items", "rows", "emails", "data", "responses"):
-                if key in data:
+                if key in data and isinstance(data[key], list):
                     inner = data[key]
-                    if isinstance(inner, list):
-                        # réutilise la logique liste
-                        if inner and isinstance(inner[0], dict):
-                            for obj in inner:
-                                em = str(obj.get("email", "")).strip().lower()
-                                ts = _parse_ts(obj.get("submitted_at") or obj.get("timestamp") or obj.get("ts"))
-                                if em:
-                                    mapping[em] = ts
-                        else:
-                            for x in inner:
-                                em = str(x).strip().lower()
-                                if em:
-                                    mapping[em] = None
-                        return mapping
+                    if inner and isinstance(inner[0], dict):
+                        for obj in inner:
+                            em = str(obj.get("email", "")).strip().lower()
+                            ts = _parse_ts(obj.get("submitted_at") or obj.get("timestamp") or obj.get("ts"))
+                            if em:
+                                mapping[em] = ts
+                    else:
+                        for x in inner:
+                            em = str(x).strip().lower()
+                            if em:
+                                mapping[em] = None
+                    return mapping
         return mapping
     except Exception as e:
-        print(f"(Gateway) Erreur lors de la récupération (map) pour formId={form_id}: {e}")
+        print(f"(Gateway) Erreur formId={form_id}: {e}")
         return mapping
 
-
-# --- Helpers Notion ----------------------------------------------------------
-async def _fetch_all_pages(notion: AsyncClient) -> List[dict]:
-    """Récupère toutes les pages de la DB (pagination)."""
+# --- Notion helpers ---
+async def _notion_query_all(notion: AsyncClient, database_id: str, filter_: Optional[dict] = None) -> List[dict]:
     results: List[dict] = []
     start_cursor = None
     while True:
-        resp = await notion.databases.query(
-            database_id=str(NOTION_DATABASE_ID), start_cursor=start_cursor
-        )
+        kwargs = {"database_id": database_id, "start_cursor": start_cursor}
+        if filter_:
+            kwargs["filter"] = filter_
+        resp = await notion.databases.query(**kwargs)
         results.extend(resp.get("results", []))
         if not resp.get("has_more"):
             break
         start_cursor = resp.get("next_cursor")
     return results
 
+def _get_title_text(page: dict, title_prop: str = "Name") -> str:
+    props = page.get("properties", {})
+    p = props.get(title_prop) or {}
+    arr = p.get("title") or []
+    if arr and isinstance(arr, list):
+        return (arr[0].get("plain_text") or "").strip()
+    return ""
 
-def _extract_prop_text(props: dict, name: str) -> Optional[str]:
-    p = props.get(name)
-    if not isinstance(p, dict):
+async def _find_form_page_by_google_form_id(notion: AsyncClient, google_form_id: str) -> Optional[dict]:
+    if not NOTION_FORMS_DB_ID:
         return None
-    if p.get("rich_text"):
-        return (p["rich_text"][0].get("plain_text") or "").strip()
-    if p.get("title"):
-        return (p["title"][0].get("plain_text") or "").strip()
-    if p.get("url"):
-        return (p.get("url") or "").strip()
-    return None
+    flt = {"property": "Form ID", "rich_text": {"equals": google_form_id}}
+    items = await _notion_query_all(notion, NOTION_FORMS_DB_ID, filter_=flt)
+    return items[0] if items else None
 
-
-def _extract_prop_email(props: dict, name: str = "Email") -> Optional[str]:
-    p = props.get(name)
-    if isinstance(p, dict) and p.get("email"):
-        return (p.get("email") or "").strip().lower()
-    return None
-
-
-def _extract_prop_checkbox(props: dict, name: str) -> bool:
-    p = props.get(name)
-    if isinstance(p, dict):
-        return bool(p.get("checkbox", False))
-    return False
-
-
-def _ensure_forms_in_db_from_pages(pages: List[dict]) -> Dict[str, int]:
-    """Crée les enregistrements Form si absents et retourne {google_form_id: form_db_id}."""
-    mapping: Dict[str, int] = {}
-    with SessionLocal() as db:
-        for page in pages:
-            props = page.get("properties", {})
-            fid = _extract_prop_text(props, "Form ID")
-            if not fid:
-                continue
-            fid = fid.strip()
-            existing = db.query(Form).filter(Form.google_form_id == fid).first()
-            if not existing:
-                existing = Form(google_form_id=fid, title=None)
-                db.add(existing)
-                db.commit()
-                db.refresh(existing)
-            title = _extract_prop_text(props, "Nom du formulaire")
-            # Pylance/SQLAlchemy: ne pas évaluer directement existing.title en booléen
-            cur_title: Optional[str] = cast(Optional[str], getattr(existing, "title"))
-            if (title is not None) and (cur_title != title):
-                setattr(existing, "title", title)
-                db.commit()
-            # existing.id is an int at runtime but SQLAlchemy typings mark it as Column[int]; cast explicitly
-            if existing.id is not None:
-                mapping[fid] = int(cast(int, existing.id))
+async def _people_email_map(notion: AsyncClient) -> Dict[str, str]:
+    """Return {person_page_id: email} from People DB."""
+    mapping: Dict[str, str] = {}
+    if not NOTION_PEOPLE_DB_ID:
+        return mapping
+    people = await _notion_query_all(notion, NOTION_PEOPLE_DB_ID)
+    for p in people:
+        props = p.get("properties", {})
+        email_prop = props.get("Email") or {}
+        email_val = (email_prop.get("email") or "").strip().lower()
+        if email_val:
+            mapping[p["id"]] = email_val
     return mapping
 
-def _insert_new_responses_map(form_db_id: int, email_map: Dict[str, Optional[datetime]]) -> int:
-    """Insère en DB uniquement les nouvelles réponses (par email) pour un form donné."""
-    if not email_map:
-        return 0
-    new_count = 0
-    with SessionLocal() as db:
-        known: Set[str] = {str(r.email) for r in db.query(Response).filter(Response.form_id == form_db_id)}
-        to_add: Set[str] = set(email_map.keys()) - known
-        for em in to_add:
-            ts = email_map.get(em) or datetime.utcnow()
-            db.add(Response(form_id=form_db_id, email=em, submitted_at=ts))
-        if to_add:
-            db.commit()
-            new_count = len(to_add)
-    return new_count
+async def _people_psid_map(notion: AsyncClient) -> Dict[str, str]:
+    """Return {person_page_id: psid} from People DB."""
+    mapping: Dict[str, str] = {}
+    if not NOTION_PEOPLE_DB_ID:
+        return mapping
+    people = await _notion_query_all(notion, NOTION_PEOPLE_DB_ID)
+    for p in people:
+        props = p.get("properties", {})
+        psid_prop = props.get("PSID Messenger") or props.get("PSID") or {}
+        psid_val = (psid_prop.get("rich_text", [{}])[0].get("plain_text") or "").strip()
+        if not psid_val and isinstance(psid_prop, dict) and psid_prop.get("rich_text") is None:
+            # If PSID is stored as plain text property type (title/rich_text fallback)
+            psid_val = (psid_prop.get("plain_text") or "").strip()
+        if psid_val:
+            mapping[p["id"]] = psid_val
+    return mapping
 
-async def _update_notion_checkboxes_for_fid(notion: AsyncClient, pages: List[dict], fid: str, emails_for_form: Set[str]) -> int:
-    """Met à jour la case 'A répondu' dans Notion pour un Form ID donné (retourne nb de mises à jour)."""
-    updated = 0
-    for page in pages:
-        props = page.get("properties", {})
-        pfid = _extract_prop_text(props, "Form ID")
-        if pfid != fid:
-            continue
-        email = _extract_prop_email(props, "Email")
-        answered = _extract_prop_checkbox(props, "A répondu")
-        if email and (email in emails_for_form) and not answered:
+# --- Bootstrap: create Responses rows for all People for a specific Form ---
+async def bootstrap_form_async(google_form_id: str) -> int:
+    if not (NOTION_TOKEN and NOTION_FORMS_DB_ID and NOTION_PEOPLE_DB_ID and NOTION_RESPONSES_DB_ID):
+        raise RuntimeError("Notion DB IDs or token missing")
+
+    notion = AsyncClient(auth=NOTION_TOKEN)
+    created = 0
+    try:
+        form_page = await _find_form_page_by_google_form_id(notion, google_form_id)
+        if not form_page:
+            raise RuntimeError(f"Form with Form ID={google_form_id} not found in Notion")
+        form_page_id = form_page["id"]
+        form_title = _get_title_text(form_page, title_prop="Nom du formulaire") or _get_title_text(form_page) or google_form_id
+
+        people_pages = await _notion_query_all(notion, NOTION_PEOPLE_DB_ID)
+        people_ids = [p["id"] for p in people_pages]
+
+        resp_filter = {"property": "Form", "relation": {"contains": form_page_id}}
+        existing_responses = await _notion_query_all(notion, NOTION_RESPONSES_DB_ID, filter_=resp_filter)
+        existing_person_ids: Set[str] = set()
+        for r in existing_responses:
+            props = r.get("properties", {})
+            rel = props.get("Person") or {}
+            for it in (rel.get("relation") or []):
+                pid = it.get("id")
+                if pid:
+                    existing_person_ids.add(pid)
+
+        for pid in people_ids:
+            if pid in existing_person_ids:
+                continue
+            props = {
+                "Name": {"title": [{"text": {"content": form_title}}]},
+                "Form": {"relation": [{"id": form_page_id}]},
+                "Person": {"relation": [{"id": pid}]},
+                "A répondu": {"checkbox": False},
+            }
             try:
-                await notion.pages.update(
-                    page_id=page["id"], properties={"A répondu": {"checkbox": True}}
-                )
-                updated += 1
-            except Exception as e:
-                print(f"(Sync) Erreur mise à jour page {page.get('id')}: {e}")
-    return updated
-
-
-# --- SYNC: Forms -> Notion ---------------------------------------------------
-async def sync_notion_checkbox_from_forms() -> int:
-    """Coche 'A répondu' si — et seulement si — l'email a répondu AU form lié à la ligne."""
-    notion = AsyncClient(auth=NOTION_TOKEN)
-    try:
-        pages = await _fetch_all_pages(notion)
-
-        # Collecte des Form IDs uniques présents en DB
-        unique_fids: Set[str] = set()
-        for page in pages:
-            props = page.get("properties", {})
-            fid = _extract_prop_text(props, "Form ID")
-            if fid:
-                unique_fids.add(fid)
-
-        if not unique_fids:
-            print("(Sync) Aucun Form ID détecté dans Notion — synchro ignorée")
-            return 0
-
-        # Récupération des emails par Form ID en parallèle (I/O bound)
-        form_id_to_maps: Dict[str, Dict[str, Optional[datetime]]] = {}
-        with ThreadPoolExecutor(max_workers=min(8, len(unique_fids))) as pool:
-            futures = {pool.submit(get_form_email_map_from_gateway, fid): fid for fid in unique_fids}
-            for fut in as_completed(futures):
-                fid = futures[fut]
-                try:
-                    form_id_to_maps[fid] = fut.result() or {}
-                except Exception as e:
-                    print(f"(Gateway) Erreur pour formId={fid}: {e}")
-                    form_id_to_maps[fid] = {}
-
-        print(f"(Gateway) formIds détectés: {sorted(unique_fids)}")
-        total_emails = sum(len(v) for v in form_id_to_maps.values())
-        print(f"(Gateway) emails récupérés (agrégés): {total_emails}")
-
-        # S’assurer que les forms existent en DB et enregistrer les nouvelles réponses
-        fid_to_dbid = _ensure_forms_in_db_from_pages(pages)
-        saved_total = 0
-        for fid, email_map in form_id_to_maps.items():
-            dbid = fid_to_dbid.get(fid)
-            if dbid:
-                saved_total += _insert_new_responses_map(dbid, email_map)
-        print(f"(DB) Nouvelles réponses sauvegardées: {saved_total}")
-
-        updated = 0
-        matched = 0
-        for fid, email_map in form_id_to_maps.items():
-            emails_set = set(email_map.keys())
-            matched += len(emails_set)
-            updated += await _update_notion_checkboxes_for_fid(notion, pages, fid, emails_set)
-
-        print(f"(Sync) {matched} correspondances trouvées. {updated} nouvelles réponses mises à jour dans Notion")
-        return updated
+                await notion.pages.create(parent={"database_id": NOTION_RESPONSES_DB_ID}, properties=props)
+                created += 1
+            except Exception as ce:
+                print(f"(Bootstrap) Create response row failed for person {pid}: {ce}")
+        print(f"(Bootstrap) Created {created} response rows for form {google_form_id}")
+        return created
     finally:
-        # Graceful close (handles libraries without .close or with sync/async close)
         try:
             maybe_close = getattr(notion, "close", None) or getattr(notion, "aclose", None)
             if callable(maybe_close):
-                result = maybe_close()
-                if asyncio.iscoroutine(result):
-                    await result
+                res = maybe_close()
+                if asyncio.iscoroutine(res):
+                    await res
         except Exception:
             pass
 
+# --- Sync: mark responses for one Form ---
+async def sync_form_async(google_form_id: str) -> int:
+    if not (NOTION_TOKEN and NOTION_FORMS_DB_ID and NOTION_RESPONSES_DB_ID):
+        raise RuntimeError("Notion DB IDs or token missing")
 
-# --- SEND: Notion -> Messenger ----------------------------------------------
-def _fb_send_message(psid: str, text: str) -> bool:
-    if not PAGE_TOKEN:
-        print("(Send) PAGE_TOKEN manquant — envoi ignoré")
-        return False
-    url = "https://graph.facebook.com/v17.0/me/messages"
-    payload = {"recipient": {"id": psid}, "message": {"text": text}}
-    try:
-        resp = requests.post(url, params={"access_token": PAGE_TOKEN}, json=payload, timeout=20)
-        ok = resp.ok
-        if not ok:
-            print(f"(Send) Erreur API FB {resp.status_code}: {resp.text}")
-        return ok
-    except Exception as e:
-        print(f"(Send) Exception API FB: {e}")
-        return False
-
-
-async def send_reminders() -> int:
-    """Envoie des rappels aux lignes sans 'A répondu' et avec PSID présent."""
     notion = AsyncClient(auth=NOTION_TOKEN)
-    sent = 0
+    updated = 0
     try:
-        pages = await _fetch_all_pages(notion)
-        for page in pages:
-            props = page.get("properties", {})
-            answered = _extract_prop_checkbox(props, "A répondu")
-            if answered:
+        form_page = await _find_form_page_by_google_form_id(notion, google_form_id)
+        if not form_page:
+            raise RuntimeError(f"Form with Form ID={google_form_id} not found in Notion")
+        form_page_id = form_page["id"]
+
+        # 1) Gateway map {email -> submitted_at}
+        email_map = get_form_email_map_from_gateway(google_form_id)
+        if not email_map:
+            print(f"(Sync) Aucun email renvoyé pour form={google_form_id}")
+
+        # 2) People map {person_id -> email}
+        person_email = await _people_email_map(notion)
+        # 3) Responses for this form
+        resp_filter = {"property": "Form", "relation": {"contains": form_page_id}}
+        responses = await _notion_query_all(notion, NOTION_RESPONSES_DB_ID, filter_=resp_filter)
+
+        # 4) Update each response if that person's email is in email_map
+        for r in responses:
+            props = r.get("properties", {})
+            rel = props.get("Person") or {}
+            rel_arr = rel.get("relation") or []
+            if not rel_arr:
                 continue
-            # Besoin d'un PSID + lien Form pour un rappel utile
-            psid = _extract_prop_text(props, "PSID")
-            form_link = _extract_prop_text(props, "Form Link")
-            sent_date = _extract_prop_text(props, "Date d'envoi") or _extract_prop_text(props, "Date d’envoi")
-            email = _extract_prop_email(props, "Email") or ""
-
-            if not psid:
+            pid = rel_arr[0].get("id")
+            if not pid:
                 continue
-
-            # Compose le message
-            date_txt = sent_date or "(date non renseignée)"
-            link_txt = form_link or "(Pas de lien fourni)"
-            msg = (
-                f"Bonjour 👋, tu n’as pas encore rempli le formulaire envoyé le {date_txt}.\n"
-                f"Merci de le remplir ici : {link_txt}"
-            )
-
-            if DRY_RUN:
-                print(f"(DRY_RUN) [PSID={psid}] {msg}")
-                sent += 1
-            else:
-                if _fb_send_message(psid, msg):
-                    sent += 1
-                    if RATE_LIMIT_MS > 0:
-                        time.sleep(RATE_LIMIT_MS / 1000.0)
-        print(f"(Send) Rappels envoyés : {sent}")
-        return sent
-    finally:
-        # Graceful close (handles libraries without .close or with sync/async close)
-        try:
-            maybe_close = getattr(notion, "close", None) or getattr(notion, "aclose", None)
-            if callable(maybe_close):
-                result = maybe_close()
-                if asyncio.iscoroutine(result):
-                    await result
-        except Exception:
-            pass
-
-
-# --- Wrappers synchrones pour app.py (/admin) -------------------------------
-def run_sync_from_forms_sync() -> int:
-    return asyncio.run(sync_notion_checkbox_from_forms())
-
-
-def run_send_reminders_sync() -> int:
-    return asyncio.run(send_reminders())
-
-
-def run_sync_single_form_sync(form_db_id: int) -> int:
-    return asyncio.run(_sync_single_form(form_db_id))
-
-
-async def _sync_single_form(form_db_id: int) -> int:
-    # Récupère le google_form_id depuis la DB, puis fait un cycle réduit sur ce seul form
-    notion = AsyncClient(auth=NOTION_TOKEN)
-    try:
-        with SessionLocal() as db:
-            f = db.query(Form).filter(Form.id == form_db_id).first()
-            if not f:
-                print(f"(Sync) Form id {form_db_id} introuvable en DB")
-                return 0
-            fid = f.google_form_id
-        # Fetch pages Notion (une fois) puis ne traiter que ce fid
-        pages = await _fetch_all_pages(notion)
-        fid_str = str(fid)
-        email_map = get_form_email_map_from_gateway(fid_str)
-        saved = _insert_new_responses_map(form_db_id, email_map)
-        # MAJ Notion uniquement pour ce fid
-        updated = await _update_notion_checkboxes_for_fid(notion, pages, fid_str, set(email_map.keys()))
-        print(f"(Sync single) fid={fid_str}: saved={saved}, updated={updated}")
+            email = person_email.get(pid, "")
+            if not email:
+                continue
+            if email in email_map:
+                submitted_at = email_map[email] or datetime.utcnow()
+                answered_prop = props.get("A répondu") or {}
+                already = bool(answered_prop.get("checkbox", False))
+                if not already:
+                    try:
+                        await notion.pages.update(
+                            page_id=r["id"],
+                            properties={
+                                "A répondu": {"checkbox": True},
+                                "Date de réponse": {"date": {"start": submitted_at.isoformat()}},
+                            },
+                        )
+                        updated += 1
+                    except Exception as e:
+                        print(f"(Sync) Update failed for response {r.get('id')}: {e}")
+        print(f"(Sync) Mises à jour: {updated}")
         return updated
     finally:
         try:
@@ -391,12 +259,113 @@ async def _sync_single_form(form_db_id: int) -> int:
         except Exception:
             pass
 
+# --- Send: reminders for one Form ---
+def _fb_send_message(psid: str, text: str) -> bool:
+    if not PAGE_TOKEN:
+        print("(Send) PAGE_TOKEN manquant — envoi ignoré")
+        return False
+    url = "https://graph.facebook.com/v17.0/me/messages"
+    payload = {"recipient": {"id": psid}, "message": {"text": text}}
+    try:
+        resp = requests.post(url, params={"access_token": PAGE_TOKEN}, json=payload, timeout=20)
+        if not resp.ok:
+            print(f"(Send) Erreur API FB {resp.status_code}: {resp.text}")
+        return resp.ok
+    except Exception as e:
+        print(f"(Send) Exception API FB: {e}")
+        return False
 
-def get_forms_summary() -> List[dict]:
-    """Retourne une liste de dicts {id, google_form_id, responses_count}."""
-    with SessionLocal() as db:
-        out = []
-        for f in db.query(Form).all():
-            cnt = db.query(Response).filter(Response.form_id == f.id).count()
-            out.append({"id": f.id, "google_form_id": f.google_form_id, "title": f.title or "", "responses_count": cnt})
-        return out
+async def send_reminders_for_form_async(google_form_id: str) -> int:
+    if not (NOTION_TOKEN and NOTION_FORMS_DB_ID and NOTION_RESPONSES_DB_ID):
+        raise RuntimeError("Notion DB IDs or token missing")
+
+    notion = AsyncClient(auth=NOTION_TOKEN)
+    sent = 0
+    try:
+        form_page = await _find_form_page_by_google_form_id(notion, google_form_id)
+        if not form_page:
+            raise RuntimeError(f"Form with Form ID={google_form_id} not found in Notion")
+        form_page_id = form_page["id"]
+        # Retrieve form link for message
+        form_link = ""
+        props = form_page.get("properties", {})
+        link_prop = props.get("Lien") or props.get("Form Link") or {}
+        if isinstance(link_prop, dict):
+            form_link = (link_prop.get("url") or "").strip()
+
+        person_psid = await _people_psid_map(notion)
+        # Responses needing reminders
+        resp_filter = {"property": "Form", "relation": {"contains": form_page_id}}
+        responses = await _notion_query_all(notion, NOTION_RESPONSES_DB_ID, filter_=resp_filter)
+
+        for r in responses:
+            props = r.get("properties", {})
+            # Skip answered
+            answered = bool((props.get("A répondu") or {}).get("checkbox", False))
+            if answered:
+                continue
+            rel = props.get("Person") or {}
+            rel_arr = rel.get("relation") or []
+            if not rel_arr:
+                continue
+            pid = rel_arr[0].get("id")
+            if not pid:
+                continue
+            psid = person_psid.get(pid, "")
+            if not psid:
+                continue
+
+            # Compose message
+            link_txt = form_link or "(lien indisponible)"
+            msg = (
+                "Bonjour 👋, petit rappel pour compléter le formulaire.\n"
+                f"Lien : {link_txt}"
+            )
+
+            if DRY_RUN:
+                print(f"(DRY_RUN) [PSID={psid}] {msg}")
+                sent += 1
+                try:
+                    await notion.pages.update(
+                        page_id=r["id"],
+                        properties={
+                            "Dernier rappel": {"date": {"start": datetime.utcnow().isoformat()}}
+                        },
+                    )
+                except Exception as ue:
+                    print(f"(Send) Update dernier rappel failed for response {r.get('id')}: {ue}")
+            else:
+                if _fb_send_message(psid, msg):
+                    sent += 1
+                    try:
+                        await notion.pages.update(
+                            page_id=r["id"],
+                            properties={
+                                "Dernier rappel": {"date": {"start": datetime.utcnow().isoformat()}}
+                            },
+                        )
+                    except Exception as ue:
+                        print(f"(Send) Update dernier rappel failed for response {r.get('id')}: {ue}")
+                    if RATE_LIMIT_MS > 0:
+                        time.sleep(RATE_LIMIT_MS / 1000.0)
+        print(f"(Send) Rappels envoyés: {sent}")
+        return sent
+    finally:
+        try:
+            maybe_close = getattr(notion, "close", None) or getattr(notion, "aclose", None)
+            if callable(maybe_close):
+                res = maybe_close()
+                if asyncio.iscoroutine(res):
+                    await res
+        except Exception:
+            pass
+
+# --- Sync wrappers (sync versions for Flask routes) ---
+def bootstrap_form(google_form_id: str) -> int:
+    return asyncio.run(bootstrap_form_async(google_form_id))
+
+def sync_form(google_form_id: str) -> int:
+    return asyncio.run(sync_form_async(google_form_id))
+
+def send_reminders_for_form(google_form_id: str) -> int:
+    return asyncio.run(send_reminders_for_form_async(google_form_id))
