@@ -7,6 +7,10 @@ app = Flask(__name__)
 # Clé API Messenger (stockée dans les variables d'env Render)
 PAGE_TOKEN = os.getenv("PAGE_TOKEN")
 
+@app.route('/')
+def home():
+    return '✅ Server is running!'
+
 def send_message(psid, message):
     url = f"https://graph.facebook.com/v18.0/me/messages?access_token={PAGE_TOKEN}"
     payload = {
@@ -18,6 +22,7 @@ def send_message(psid, message):
 
 @app.route("/notion-webhook", methods=["POST"])
 def notion_webhook():
+    print("Webhook Notion reçu")
     data = request.json
     if not data:
         return jsonify({"error": "No JSON payload received"}), 400
