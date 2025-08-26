@@ -1,3 +1,29 @@
+def send_messages_to_unanswered():
+    NOTION_API_KEY = os.getenv("NOTION_API_KEY")
+    DATABASE_ID = os.getenv("NOTION_RESPONSES_DB")
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
+
+    query_url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
+    response = requests.post(query_url, headers=headers)
+    if response.status_code != 200:
+        print("Failed to fetch Notion database:", response.text)
+        return
+
+    results = response.json().get("results", [])
+    for page in results:
+        props = page.get("properties", {})
+        psid_field = props.get("PSID", {}).get("rich_text", [])
+        reponse_checkbox = props.get("n'a pas répondu", {}).get("checkbox", False)
+
+        if reponse_checkbox and psid_field and "plain_text" in psid_field[0]:
+            psid = psid_field[0]["plain_text"]
+            print(f"Sending message to PSID: {psid}")
+            send_message(psid, "Tu n’as pas encore répondu au formulaire !")
 from flask import Flask, request, jsonify
 import requests
 import os
@@ -43,3 +69,11 @@ def notion_webhook():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
+
+# Route pour déclencher l'envoi aux non-répondants
+@app.route("/forms-trigger", methods=["POST"])
+def forms_trigger():
+    print("Webhook Forms reçu")
+    send_messages_to_unanswered()
+    return jsonify({"status": "messages sent"})
