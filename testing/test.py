@@ -20,7 +20,7 @@ def test_notion_client():
     """Test 2: Check if Notion client works"""
     print("\n🧪 Testing Notion client...")
     try:
-        from notion_client import NotionClient
+        from notion_connection import NotionClient
         notion = NotionClient()
         
         # Try to get forms

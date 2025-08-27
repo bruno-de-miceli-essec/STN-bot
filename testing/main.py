@@ -21,11 +21,11 @@ def main():
         service = ReminderService()
         
         # Option 1: Get summary report (no messages sent)
-        print("\n" + service.get_summary_report())
+        #print("\n" + service.get_summary_report())
         
         # Option 2: Send reminders for all forms
-        # summary = service.send_reminders_for_all_forms()
-        # print(f"\n📊 Summary: {summary}")
+        summary = service.send_reminders_for_all_forms()
+        print(f"\n📊 Summary: {summary}")
         
         # Option 3: Send reminders for specific form
         # form_id = "your_form_id_here"
