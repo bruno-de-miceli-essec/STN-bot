@@ -10,11 +10,7 @@ class NotionColumns:
     
     # Forms database columns
     FORM_NAME = "Nom du formulaire"
-    
-    # Extra fields
-    FORM_LINK = "Lien du formulaire"
-    DATE_SENT = "Date envoi"
-    LAST_REMINDER = "Dernier Rappel"
+    GOOGLE_FORM_ID = "Form ID"  # New field for Google Forms integration
     
     # Responses database columns  
     FORMS_RELATION = "Forms"
@@ -24,6 +20,7 @@ class NotionColumns:
     # People database columns
     PERSON_NAME = "Prénom & Nom"
     PERSON_PSID = "PSID"
+    PERSON_EMAIL = "Email"  # New field for email synchronization
     
     @classmethod
     def validate_property_exists(cls, page: Dict, property_name: str) -> bool:
@@ -39,8 +36,6 @@ class NotionClient:
             "Content-Type": "application/json"
         }
         self.columns = NotionColumns()
-        self.form_names: Dict[str, str] = {}
-        self.form_links: Dict[str, str] = {}
     
     def get_database_entries(self, database_id: str) -> List[Dict]:
         """Fetch all entries from a Notion database."""
@@ -55,56 +50,6 @@ class NotionClient:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to fetch database entries: {e}")
             return []
-    
-    def build_form_name_index(self, forms: List[Dict]) -> None:
-        """Populate local cache mapping form_id -> form_name."""
-        self.form_names.clear()
-        self.form_links.clear()
-        for form in forms:
-            try:
-                fid = form.get("id", "")
-                fname = self.get_property_content(form, self.columns.FORM_NAME)
-                flink = self.get_property_content(form, self.columns.FORM_LINK)
-                if fid and fname:
-                    self.form_names[fid] = fname
-                if fid and flink:
-                    self.form_links[fid] = flink
-            except Exception as e:
-                logger.warning(f"Failed to index form: {e}")
-    
-    def get_form_name(self, form_id: str) -> str:
-        """Return the human name for a form_id, using cache; fallback to fetching the page once."""
-        if form_id in self.form_names:
-            return self.form_names[form_id]
-        # Fallback: attempt to fetch the page and extract name, then cache
-        try:
-            url = f"{self.base_url}/pages/{form_id}"
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
-            page = response.json()
-            fname = self.get_property_content(page, self.columns.FORM_NAME)
-            if fname:
-                self.form_names[form_id] = fname
-            return fname
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Could not resolve form name for {form_id}: {e}")
-            return ""
-    
-    def get_form_link(self, form_id: str) -> str:
-        if form_id in self.form_links:
-            return self.form_links[form_id]
-        # Fallback single fetch
-        try:
-            url = f"{self.base_url}/pages/{form_id}"
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
-            page = response.json()
-            flink = self.get_property_content(page, self.columns.FORM_LINK)
-            if flink:
-                self.form_links[form_id] = flink
-            return flink or ""
-        except requests.exceptions.RequestException:
-            return ""
     
     def get_property_content(self, page: Dict, property_name: str) -> str:
         """Extract content from a Notion page property."""
@@ -121,45 +66,13 @@ class NotionClient:
                 return content_value[0]["plain_text"]
             elif property_type == "title" and content_value:
                 return content_value[0]["plain_text"]
-            elif property_type == "url":
-                return content_value or ""
+            elif property_type == "email" and content_value:
+                return content_value
             
             return ""
         except (KeyError, IndexError, TypeError) as e:
             logger.warning(f"Could not extract content for property '{property_name}': {e}")
             return ""
-    
-    def get_date_property(self, page: Dict, property_name: str) -> Optional[str]:
-        """Extract ISO datetime string from a Notion date property (start)."""
-        try:
-            if not self.columns.validate_property_exists(page, property_name):
-                return None
-            prop = page["properties"][property_name]
-            if prop["type"] != "date":
-                return None
-            date_obj = prop["date"]
-            if not date_obj:
-                return None
-            return date_obj.get("start")
-        except (KeyError, TypeError):
-            return None
-    
-    def format_datetime_fr(self, iso_str: Optional[str]) -> Optional[str]:
-        from datetime import datetime
-        if not iso_str:
-            return None
-        try:
-            # Prefer aware parsing if timezone present
-            try:
-                from zoneinfo import ZoneInfo
-                dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-                dt = dt.astimezone(ZoneInfo("Africa/Casablanca")) if dt.tzinfo else dt
-            except Exception:
-                dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-            mois = ["janvier","février","mars","avril","mai","juin","juillet","août","septembre","octobre","novembre","décembre"]
-            return f"le {dt.day} {mois[dt.month-1]} {dt.year} à {dt.hour}h"
-        except Exception:
-            return None
     
     def get_checkbox_value(self, page: Dict, property_name: str) -> bool:
         """Extract boolean value from a checkbox property."""
@@ -199,10 +112,8 @@ class NotionClient:
             return []
     
     def get_all_forms(self) -> List[Dict]:
-        """Get all forms from the forms database and (re)build the id→name index."""
-        forms = self.get_database_entries(config.notion_forms_db_id)
-        self.build_form_name_index(forms)
-        return forms
+        """Get all forms from the forms database."""
+        return self.get_database_entries(config.notion_forms_db_id)
     
     def get_responses_for_form(self, form_id: str) -> List[Dict]:
         """Get all responses that are related to a specific form."""
@@ -217,18 +128,8 @@ class NotionClient:
             if form_id in related_form_ids:
                 form_responses.append(response)
         
-        form_name = self.get_form_name(form_id)
-        logger.info(f"Found {len(form_responses)} responses for form '{form_name or form_id}'")
+        logger.info(f"Found {len(form_responses)} responses for form {form_id}")
         return form_responses
-    
-    def get_response_for_person_form(self, form_id: str, person_id: str) -> Optional[Dict]:
-        """Return the response page linking this person to this form, if any."""
-        responses = self.get_responses_for_form(form_id)
-        for r in responses:
-            person_ids = self.get_relation_ids(r, self.columns.PERSON_RELATION)
-            if person_id in person_ids:
-                return r
-        return None
     
     def get_non_responders_for_form(self, form_id: str) -> List[Dict]:
         """Get list of people who haven't responded to a specific form."""
@@ -250,8 +151,7 @@ class NotionClient:
                     if person:
                         non_responders.append(person)
                 
-        form_name = self.get_form_name(form_id)
-        logger.info(f"Found {len(non_responders)} non-responders for form '{form_name or form_id}'")
+        logger.info(f"Found {len(non_responders)} non-responders for form {form_id}")
         return non_responders
     
     def get_person_by_id(self, person_id: str) -> Optional[Dict]:
@@ -274,7 +174,7 @@ class NotionClient:
         
         for form in all_forms:
             form_id = form["id"]
-            form_name = self.get_form_name(form_id)
+            form_name = self.get_property_content(form, self.columns.FORM_NAME)
             
             if not form_name:
                 logger.warning(f"Form {form_id} has no name, skipping")
@@ -286,3 +186,25 @@ class NotionClient:
             logger.info(f"Form '{form_name}': {len(non_responders)} non-responders")
         
         return results
+    
+    def update_response_status(self, response_id: str, has_responded: bool) -> bool:
+        """Update the 'A répondu' checkbox for a response."""
+        url = f"{self.base_url}/pages/{response_id}"
+        
+        data = {
+            "properties": {
+                self.columns.HAS_RESPONDED: {
+                    "checkbox": has_responded
+                }
+            }
+        }
+        
+        try:
+            response = requests.patch(url, headers=self.headers, json=data)
+            response.raise_for_status()
+            logger.info(f"✅ Updated response status for {response_id}")
+            return True
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Failed to update response status for {response_id}: {e}")
+            return False
