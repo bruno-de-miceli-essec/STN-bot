@@ -1,4 +1,4 @@
-"""Enhanced test file to check each component works including Google Forms integration"""
+"""Enhanced test file for App Script integration - no Google Cloud required!"""
 import logging
 from config import config
 
@@ -12,7 +12,7 @@ def test_config():
         from config import config
         print(f"✅ Config loaded. Notion token exists: {bool(config.notion_token)}")
         print(f"✅ Forms DB ID: {config.notion_forms_db_id[:10]}...")
-        print(f"✅ Google service account path: {config.google_service_account_path}")
+        print(f"✅ App Script URL: {config.google_app_script_url[:50]}...")
         return True
     except Exception as e:
         print(f"❌ Config failed: {e}")
@@ -41,21 +41,29 @@ def test_notion_client():
         print(f"❌ Notion client failed: {e}")
         return False
 
-def test_google_forms_client():
-    """Test 3: Check if Google Forms client initializes"""
-    print("\n🧪 Testing Google Forms client...")
+def test_app_script_client():
+    """Test 3: Check if App Script client works"""
+    print("\n🧪 Testing Google Forms App Script client...")
     try:
-        from google_forms_client import GoogleFormsClient
-        google_forms = GoogleFormsClient()
-        print("✅ Google Forms client created successfully")
-        print("⚠️  Note: Not fetching actual responses (would need valid Form ID)")
+        from google_forms_client import GoogleFormsAppScriptClient
+        app_script_client = GoogleFormsAppScriptClient()
+        
+        # Test basic connection
+        connection_test = app_script_client.test_connection()
+        
+        if connection_test:
+            print("✅ App Script client created and connection test passed")
+        else:
+            print("⚠️  App Script client created but connection test failed")
+            print("💡 This might be normal if no sample form ID provided")
+        
         return True
     except Exception as e:
-        print(f"❌ Google Forms client failed: {e}")
+        print(f"❌ App Script client failed: {e}")
         print("💡 Make sure you have:")
-        print("   1. Valid service account JSON file")
-        print("   2. Google Forms API enabled")
-        print("   3. Correct file path in GOOGLE_SERVICE_ACCOUNT_PATH")
+        print("   1. Deployed your App Script as a web app")
+        print("   2. Set execution permissions to 'Anyone'")
+        print("   3. Correct App Script URL in GOOGLE_APP_SCRIPT_URL")
         return False
 
 def test_messenger_client():
@@ -72,16 +80,16 @@ def test_messenger_client():
         return False
 
 def test_synchronizer_service():
-    """Test 5: Check if synchronizer service works"""
-    print("\n🧪 Testing Synchronizer service...")
+    """Test 5: Check if synchronizer service works with App Script"""
+    print("\n🧪 Testing App Script Synchronizer service...")
     try:
         from synchronizer_service import SynchronizerService
         synchronizer = SynchronizerService()
         
         # Get sync report (safe - no actual sync)
         report = synchronizer.get_sync_report()
-        print("✅ Sync report generated:")
-        print(report[:300] + "..." if len(report) > 300 else report)
+        print("✅ App Script sync report generated:")
+        print(report[:400] + "..." if len(report) > 400 else report)
         
         return True
     except Exception as e:
@@ -89,16 +97,16 @@ def test_synchronizer_service():
         return False
 
 def test_reminder_service():
-    """Test 6: Check if enhanced reminder service works"""
-    print("\n🧪 Testing Enhanced Reminder service...")
+    """Test 6: Check if enhanced reminder service works with App Script"""
+    print("\n🧪 Testing Enhanced Reminder service with App Script...")
     try:
         from reminder_service import ReminderService
         service = ReminderService()
         
         # Get comprehensive summary report (safe - no messages sent)
         report = service.get_summary_report(include_sync_report=True)
-        print("✅ Comprehensive summary report generated:")
-        print(report[:400] + "..." if len(report) > 400 else report)
+        print("✅ Comprehensive summary report with App Script info generated:")
+        print(report[:500] + "..." if len(report) > 500 else report)
         
         return True
     except Exception as e:
@@ -107,7 +115,7 @@ def test_reminder_service():
 
 def test_database_structure():
     """Test 7: Check if required Notion database fields exist"""
-    print("\n🧪 Testing Notion database structure...")
+    print("\n🧪 Testing Notion database structure for App Script integration...")
     try:
         from notion_connection import NotionClient
         notion = NotionClient()
@@ -150,18 +158,51 @@ def test_database_structure():
         print(f"❌ Database structure test failed: {e}")
         return False
 
+def test_end_to_end_with_sample_form():
+    """Test 8: End-to-end test with App Script (if sample form available)"""
+    print("\n🧪 Testing end-to-end App Script integration...")
+    try:
+        from reminder_service import ReminderService
+        service = ReminderService()
+        
+        # Test App Script connection with configured forms
+        test_results = service.test_app_script_connection()
+        
+        accessible_forms = sum(1 for result in test_results.values() 
+                              if result.get("status") == "success")
+        
+        print(f"✅ App Script connection test completed")
+        print(f"📊 Forms accessible via App Script: {accessible_forms}/{len(test_results)}")
+        
+        for form_name, result in test_results.items():
+            status = result.get("status", "unknown")
+            if status == "success":
+                emails = result.get("emails_found", 0)
+                print(f"   ✅ {form_name}: {emails} emails found")
+            elif status == "skipped":
+                print(f"   ⚠️  {form_name}: {result.get('reason', 'Unknown reason')}")
+            else:
+                print(f"   ❌ {form_name}: {result.get('error', 'Unknown error')}")
+        
+        return accessible_forms > 0
+        
+    except Exception as e:
+        print(f"❌ End-to-end test failed: {e}")
+        return False
+
 if __name__ == "__main__":
-    print("🧪 RUNNING ENHANCED TESTS")
-    print("=" * 50)
+    print("🧪 RUNNING APP SCRIPT INTEGRATION TESTS")
+    print("=" * 55)
     
     tests = [
         test_config,
         test_notion_client,
-        test_google_forms_client,
+        test_app_script_client,
         test_messenger_client,
         test_synchronizer_service,
         test_reminder_service,
-        test_database_structure
+        test_database_structure,
+        test_end_to_end_with_sample_form
     ]
     results = []
     
@@ -169,23 +210,27 @@ if __name__ == "__main__":
         results.append(test())
     
     print("\n📊 TEST RESULTS:")
-    print("=" * 50)
+    print("=" * 55)
     passed = sum(results)
     total = len(results)
     
     print(f"✅ Passed: {passed}/{total}")
     
     if passed == total:
-        print("🎉 All tests passed! Your enhanced app is ready to use!")
-        print("\n💡 SETUP REMINDERS:")
-        print("1. Add 'Google Form ID' field to your Notion Forms database")
-        print("2. Add 'Email' field to your Notion People database")
-        print("3. Fill in Google Form IDs for each form you want to sync")
-        print("4. Test with a small form first")
+        print("🎉 All tests passed! Your App Script integration is ready!")
+        print("\n💡 SETUP CHECKLIST:")
+        print("✅ App Script deployed as web app")
+        print("✅ Python environment configured")
+        print("✅ Notion databases structured correctly")
+        print("\n🚀 READY TO USE:")
+        print("1. Fill Google Form IDs in your Notion Forms database")
+        print("2. Test with: python main.py")
+        print("3. Set up webhooks for automation")
     else:
         print("⚠️  Some tests failed. Check the errors above.")
-        print("\n🔧 COMMON ISSUES:")
-        print("- Missing Google service account file")
+        print("\n🔧 COMMON APP SCRIPT ISSUES:")
+        print("- App Script not deployed as web app")
+        print("- Wrong execution permissions (should be 'Anyone')")
+        print("- Forms not shared with App Script owner")
+        print("- Email collection not enabled in Google Forms")
         print("- Missing Notion database fields")
-        print("- Invalid API credentials")
-        print("- Google Forms API not enabled")

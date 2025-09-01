@@ -1,5 +1,8 @@
 import os
+import logging
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 class Config:
     def __init__(self):
@@ -14,8 +17,16 @@ class Config:
         # Messenger configuration
         self.page_token = self._get_required_env("PAGE_TOKEN")
         
-        # Google Forms configuration
-        self.google_service_account_path = self._get_required_env("GOOGLE_SERVICE_ACCOUNT_PATH")
+        # Google App Script configuration (renamed for clarity)
+        self.google_app_script_url = self._get_required_env("GOOGLE_APP_SCRIPT_URL")
+        
+        # Backward compatibility (if you have old .env files)
+        if not hasattr(self, 'google_app_script_url'):
+            # Try the old name for backward compatibility
+            old_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
+            if old_path:
+                self.google_app_script_url = old_path
+                logger.warning("Using GOOGLE_SERVICE_ACCOUNT_PATH as App Script URL - consider renaming to GOOGLE_APP_SCRIPT_URL")
     
     def _get_required_env(self, key):
         value = os.getenv(key)

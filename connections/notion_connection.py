@@ -1,7 +1,7 @@
 import requests
 import logging
-from typing import List, Dict, Optional
-from config import config
+from typing import List, Dict, Optional, Any
+from config.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -16,9 +16,11 @@ class NotionColumns:
     FORMS_RELATION = "Forms"
     PERSON_RELATION = "Personnes"
     HAS_RESPONDED = "A répondu"
+    DATE_ENVOI = "Date envoi"
+    DERNIER_RAPPEL = "Dernier rappel"
     
     # People database columns
-    PERSON_NAME = "Prénom & Nom"
+    PERSON_NAME = "Prénom"
     PERSON_PSID = "PSID"
     PERSON_EMAIL = "Email"  # New field for email synchronization
     
@@ -62,17 +64,28 @@ class NotionClient:
             property_type = property_data["type"]
             content_value = property_data[property_type]
             
+            # Existing types
             if property_type == "rich_text" and content_value:
                 return content_value[0]["plain_text"]
             elif property_type == "title" and content_value:
                 return content_value[0]["plain_text"]
             elif property_type == "email" and content_value:
                 return content_value
+            elif property_type == "date":
+                return content_value['start']
             
             return ""
         except (KeyError, IndexError, TypeError) as e:
             logger.warning(f"Could not extract content for property '{property_name}': {e}")
             return ""
+    
+    
+    def debug_property_structure(self, page: Dict, property_name: str) -> Dict:
+        """DEBUG: Get the full structure of a property for analysis."""
+        if not self.columns.validate_property_exists(page, property_name):
+            return {"error": f"Property '{property_name}' does not exist"}
+        
+        return page["properties"][property_name]
     
     def get_checkbox_value(self, page: Dict, property_name: str) -> bool:
         """Extract boolean value from a checkbox property."""
@@ -131,6 +144,8 @@ class NotionClient:
         logger.info(f"Found {len(form_responses)} responses for form {form_id}")
         return form_responses
     
+
+
     def get_non_responders_for_form(self, form_id: str) -> List[Dict]:
         """Get list of people who haven't responded to a specific form."""
         responses = self.get_responses_for_form(form_id)
@@ -147,9 +162,11 @@ class NotionClient:
                 if person_ids:
                     # Get the actual person data
                     person_id = person_ids[0]  # Assuming one person per response
+                    response_id = response["id"]
                     person = self.get_person_by_id(person_id)
+                    name_person = self.get_property_content(person, self.columns.PERSON_NAME) if person else ""
                     if person:
-                        non_responders.append(person)
+                        non_responders.append({'non_responder': person, 'ID_reponse': response_id, 'Name_person': name_person})
                 
         logger.info(f"Found {len(non_responders)} non-responders for form {form_id}")
         return non_responders
@@ -207,4 +224,31 @@ class NotionClient:
         
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Failed to update response status for {response_id}: {e}")
+            return False
+        
+    def update_Dernier_rappel(self, response_id: str) -> bool:
+        """Update the 'Dernier rappel' date for a response page."""
+        url = f"{self.base_url}/pages/{response_id}"
+
+        from datetime import datetime, timezone
+        # Notion expects ISO 8601 / RFC3339 (e.g., 2025-09-01T12:47:15Z)
+        date_str = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        data = {
+            "properties": {
+                self.columns.DERNIER_RAPPEL: {
+                    "date": {
+                        "start": date_str
+                    }
+                }
+            }
+        }
+        
+        try:
+            response = requests.patch(url, headers=self.headers, json=data)
+            response.raise_for_status()
+            logger.info(f"✅ Updated 'Dernier Rappel' for response {response_id} to {date_str}")
+            return True
+        
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Failed to update 'Dernier Rappel' for response {response_id}: {e}")
             return False

@@ -1,4 +1,26 @@
-.venv/
+# Environment variables (NEVER commit these!)
 .env
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,6 @@
+# Core dependencies - much simpler without Google Cloud!
+requests==2.31.0
+python-dotenv==1.0.0
+
+# Note: No more Google API dependencies needed!
+# Your App Script handles all Google Forms integration
